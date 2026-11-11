@@ -1,0 +1,619 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.flink.source;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.annotation.VisibleForTesting;
+import org.apache.paimon.flink.FlinkConnectorOptions;
+import org.apache.paimon.flink.NestedProjectedRowData;
+import org.apache.paimon.flink.Projection;
+import org.apache.paimon.flink.sink.FlinkSink;
+import org.apache.paimon.flink.source.align.AlignedContinuousFileStoreSource;
+import org.apache.paimon.flink.source.operator.MonitorSource;
+import org.apache.paimon.flink.utils.TableScanUtils;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.partition.PartitionPredicate;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.table.BucketMode;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.Table;
+import org.apache.paimon.table.source.DataSplit;
+import org.apache.paimon.table.source.PostponeMergePlan;
+import org.apache.paimon.table.source.PostponeMergeReadBuilder;
+import org.apache.paimon.table.source.ReadBuilder;
+import org.apache.paimon.utils.StringUtils;
+
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.connector.source.Source;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.CheckpointingMode;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.DataStreamSource;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.environment.CheckpointConfig;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.util.DataFormatConverters;
+import org.apache.flink.table.runtime.typeutils.ExternalTypeInfo;
+import org.apache.flink.table.runtime.typeutils.InternalTypeInfo;
+import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.logical.LogicalType;
+import org.apache.flink.table.types.logical.RowType;
+import org.apache.flink.types.Row;
+
+import javax.annotation.Nullable;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+
+import static org.apache.flink.table.types.utils.TypeConversions.fromLogicalToDataType;
+import static org.apache.paimon.flink.FlinkConnectorOptions.SOURCE_OPERATOR_UID_SUFFIX;
+import static org.apache.paimon.flink.FlinkConnectorOptions.generateCustomUid;
+import static org.apache.paimon.flink.LogicalTypeConversion.toLogicalType;
+import static org.apache.paimon.flink.utils.ParallelismUtils.forwardParallelism;
+import static org.apache.paimon.options.OptionsUtils.PAIMON_PREFIX;
+import static org.apache.paimon.utils.Preconditions.checkArgument;
+import static org.apache.paimon.utils.Preconditions.checkState;
+
+/**
+ * DataStream API for building Flink Source.
+ *
+ * @since 0.8
+ */
+public class FlinkSourceBuilder {
+
+    private static final String SOURCE_NAME = "Source";
+
+    private final Table table;
+    private final Options conf;
+    private final boolean unordered;
+    private String sourceName;
+    private Boolean sourceBounded;
+    private StreamExecutionEnvironment env;
+    @Nullable private int[][] projectedFields;
+    @Nullable private Predicate predicate;
+    @Nullable private PartitionPredicate partitionPredicate;
+    @Nullable private Integer parallelism;
+    @Nullable private Long limit;
+    @Nullable private WatermarkStrategy<RowData> watermarkStrategy;
+    @Nullable private DynamicPartitionFilteringInfo dynamicPartitionFilteringInfo;
+    private boolean skipPreloadTargetSnapshot;
+
+    public FlinkSourceBuilder(Table table) {
+        this.table = table;
+        this.sourceName = table.name();
+        this.conf = Options.fromMap(table.options());
+        this.unordered = unordered(table);
+        this.skipPreloadTargetSnapshot = false;
+    }
+
+    private static boolean unordered(Table table) {
+        if (!(table instanceof FileStoreTable)) {
+            return false;
+        }
+
+        if (!table.primaryKeys().isEmpty()) {
+            return false;
+        }
+
+        BucketMode bucketMode = ((FileStoreTable) table).bucketMode();
+        if (bucketMode == BucketMode.BUCKET_UNAWARE) {
+            return true;
+        } else if (bucketMode == BucketMode.HASH_FIXED) {
+            return !Options.fromMap(table.options()).get(CoreOptions.BUCKET_APPEND_ORDERED);
+        }
+
+        return false;
+    }
+
+    public FlinkSourceBuilder env(StreamExecutionEnvironment env) {
+        this.env = env;
+        if (sourceBounded == null) {
+            sourceBounded = !FlinkSink.isStreaming(env);
+        }
+        return this;
+    }
+
+    public FlinkSourceBuilder sourceName(String name) {
+        this.sourceName = name;
+        return this;
+    }
+
+    public FlinkSourceBuilder sourceBounded(boolean bounded) {
+        this.sourceBounded = bounded;
+        return this;
+    }
+
+    public FlinkSourceBuilder projection(int[] projectedFields) {
+        return projection(Projection.of(projectedFields).toNestedIndexes());
+    }
+
+    public FlinkSourceBuilder projection(int[][] projectedFields) {
+        this.projectedFields = projectedFields;
+        return this;
+    }
+
+    public FlinkSourceBuilder predicate(Predicate predicate) {
+        this.predicate = predicate;
+        return this;
+    }
+
+    public FlinkSourceBuilder partitionPredicate(PartitionPredicate partitionPredicate) {
+        this.partitionPredicate = partitionPredicate;
+        return this;
+    }
+
+    public FlinkSourceBuilder limit(@Nullable Long limit) {
+        this.limit = limit;
+        return this;
+    }
+
+    public FlinkSourceBuilder sourceParallelism(@Nullable Integer parallelism) {
+        this.parallelism = parallelism;
+        return this;
+    }
+
+    public FlinkSourceBuilder watermarkStrategy(
+            @Nullable WatermarkStrategy<RowData> watermarkStrategy) {
+        this.watermarkStrategy = watermarkStrategy;
+        return this;
+    }
+
+    public FlinkSourceBuilder dynamicPartitionFilteringFields(
+            List<String> dynamicPartitionFilteringFields) {
+        if (dynamicPartitionFilteringFields != null && !dynamicPartitionFilteringFields.isEmpty()) {
+            checkState(
+                    table instanceof FileStoreTable,
+                    "Only Paimon FileStoreTable supports dynamic filtering but get %s.",
+                    table.getClass().getName());
+
+            this.dynamicPartitionFilteringInfo =
+                    new DynamicPartitionFilteringInfo(
+                            ((FileStoreTable) table).schema().logicalPartitionType(),
+                            dynamicPartitionFilteringFields);
+        }
+        return this;
+    }
+
+    public FlinkSourceBuilder withSkipPreloadTargetSnapshot(boolean skip) {
+        this.skipPreloadTargetSnapshot = skip;
+        return this;
+    }
+
+    private ReadBuilder createReadBuilder(@Nullable org.apache.paimon.types.RowType readType) {
+        ReadBuilder readBuilder = table.newReadBuilder();
+        if (readType != null) {
+            readBuilder.withReadType(readType);
+        }
+        if (predicate != null) {
+            readBuilder.withFilter(predicate);
+        }
+        if (partitionPredicate != null) {
+            readBuilder.withPartitionFilter(partitionPredicate);
+        }
+        if (limit != null) {
+            readBuilder.withLimit(limit);
+        }
+        return readBuilder.dropStats();
+    }
+
+    private Source<RowData, ?, ?> createSource() {
+        checkConsumerId();
+        if (sourceBounded == null) {
+            throw new IllegalArgumentException(
+                    "Cannot determine boundedness of source: please provide the "
+                            + "StreamExecutionEnvironment via env() or specify sourceBounded().");
+        }
+
+        if (sourceBounded) {
+            if (PostponeMergeOnRead.usesCustomSource(table)) {
+                throw new UnsupportedOperationException(
+                        "Postpone merge-on-read relies on a custom multi-operator topology, "
+                                + "please use build() instead.");
+            }
+            if (conf.get(FlinkConnectorOptions.SCAN_DEDICATED_SPLIT_GENERATION)) {
+                throw new UnsupportedOperationException(
+                        "scan.dedicated-split-generation relies on a monitor topology, "
+                                + "please use build() instead.");
+            }
+            Options options = Options.fromMap(table.options());
+            return new StaticFileStoreSource(
+                    createReadBuilder(projectedRowType()),
+                    limit,
+                    options.get(FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_BATCH_SIZE),
+                    options.get(FlinkConnectorOptions.SCAN_SPLIT_ENUMERATOR_ASSIGN_MODE),
+                    dynamicPartitionFilteringInfo,
+                    outerProject(),
+                    SplitWeightUtils.splitWeightFunc(options),
+                    null,
+                    options.get(CoreOptions.BLOB_AS_DESCRIPTOR),
+                    skipPreloadTargetSnapshot);
+        }
+
+        TableScanUtils.streamingReadingValidate(table);
+        if (conf.get(FlinkConnectorOptions.SOURCE_CHECKPOINT_ALIGN_ENABLED)) {
+            throw new UnsupportedOperationException(
+                    "Checkpoint align mode requires validation against the environment, "
+                            + "please use build() instead.");
+        }
+        if (conf.contains(CoreOptions.CONSUMER_ID)
+                && conf.get(CoreOptions.CONSUMER_CONSISTENCY_MODE)
+                        == CoreOptions.ConsumerMode.EXACTLY_ONCE) {
+            throw new UnsupportedOperationException(
+                    "Exactly-once consumer mode relies on a monitor topology, "
+                            + "please use build() instead.");
+        }
+        return new ContinuousFileStoreSource(
+                createReadBuilder(projectedRowType()),
+                table.options(),
+                limit,
+                unordered,
+                outerProject());
+    }
+
+    private void checkConsumerId() {
+        if (conf.contains(CoreOptions.CONSUMER_ID)
+                && !conf.contains(CoreOptions.CONSUMER_EXPIRATION_TIME)) {
+            throw new IllegalArgumentException(
+                    "You need to configure 'consumer.expiration-time' (ALTER TABLE) and restart your write job for it"
+                            + " to take effect, when you need consumer-id feature. This is to prevent consumers from leaving"
+                            + " too many snapshots that could pose a risk to the file system.");
+        }
+    }
+
+    private @Nullable DataStream<RowData> buildPostponeMergeSource() {
+        FileStoreTable fileStoreTable = (FileStoreTable) table;
+        if (fileStoreTable.coreOptions().startupMode() == CoreOptions.StartupMode.COMPACTED_FULL) {
+            return null;
+        }
+
+        Optional<PostponeMergeReadBuilder> optionalBuilder =
+                PostponeMergeReadBuilder.createSnapshotBound(fileStoreTable, partitionPredicate);
+        if (!optionalBuilder.isPresent()) {
+            return env.fromCollection(Collections.<RowData>emptyList(), produceTypeInfo())
+                    .name(sourceName)
+                    .forceNonParallel();
+        }
+
+        int baseParallelism = basePostponeMergeParallelism();
+        PostponeMergeReadBuilder readBuilder = optionalBuilder.get();
+        org.apache.paimon.types.RowType readType = projectedRowType();
+        if (readType != null) {
+            readBuilder.withReadType(readType);
+        }
+        if (predicate != null) {
+            readBuilder.withFilter(predicate);
+        }
+        PostponeMergePlan plan = readBuilder.plan();
+        int mergeParallelism = inferPostponeMergeParallelism(plan, baseParallelism);
+        return PostponeMergeOnRead.build(
+                env,
+                sourceName,
+                fileStoreTable,
+                readBuilder,
+                plan,
+                mergeParallelism,
+                produceTypeInfo(),
+                outerProject(),
+                limit,
+                conf.get(CoreOptions.BLOB_AS_DESCRIPTOR));
+    }
+
+    private int basePostponeMergeParallelism() {
+        if (parallelism != null) {
+            return parallelism;
+        }
+
+        Integer configuredParallelism = conf.get(FlinkConnectorOptions.SCAN_PARALLELISM);
+        if (configuredParallelism != null) {
+            return configuredParallelism;
+        }
+        return Math.max(1, env.getParallelism());
+    }
+
+    private int inferPostponeMergeParallelism(PostponeMergePlan plan, int baseParallelism) {
+        if (parallelism != null
+                || conf.get(FlinkConnectorOptions.SCAN_PARALLELISM) != null
+                || env.getParallelism() > 0
+                || !inferScanParallelism()) {
+            return baseParallelism;
+        }
+
+        long inferred =
+                Math.max(
+                        plan.numPotentialBuckets(),
+                        (long) plan.realSplits().size() + plan.postponeSplits().size());
+        long totalFileSize = 0L;
+        for (org.apache.paimon.table.source.Split split : plan.splits()) {
+            for (DataFileMeta file : ((DataSplit) split).dataFiles()) {
+                if (file.fileSize() > Long.MAX_VALUE - totalFileSize) {
+                    totalFileSize = Long.MAX_VALUE;
+                    break;
+                }
+                totalFileSize += file.fileSize();
+            }
+            if (totalFileSize == Long.MAX_VALUE) {
+                break;
+            }
+        }
+        long splitTargetSize = ((FileStoreTable) table).coreOptions().splitTargetSize();
+        long sizeParallelism = totalFileSize == 0 ? 1 : (totalFileSize - 1) / splitTargetSize + 1;
+        inferred = Math.max(inferred, sizeParallelism);
+        if (limit != null && limit > 0) {
+            inferred = Math.min(inferred, limit);
+        }
+        inferred =
+                Math.min(
+                        Math.max(1L, inferred),
+                        conf.get(FlinkConnectorOptions.INFER_SCAN_MAX_PARALLELISM));
+        return (int) inferred;
+    }
+
+    private boolean inferScanParallelism() {
+        Configuration envConfig = (Configuration) env.getConfiguration();
+        String flinkOption = PAIMON_PREFIX + FlinkConnectorOptions.INFER_SCAN_PARALLELISM.key();
+        if (envConfig.containsKey(flinkOption)) {
+            return Boolean.parseBoolean(envConfig.toMap().get(flinkOption));
+        }
+        return conf.get(FlinkConnectorOptions.INFER_SCAN_PARALLELISM);
+    }
+
+    private DataStream<RowData> buildAlignedContinuousFileSource() {
+        assertStreamingConfigurationForAlignMode(env);
+        return toDataStream(
+                new AlignedContinuousFileStoreSource(
+                        createReadBuilder(projectedRowType()),
+                        table.options(),
+                        limit,
+                        unordered,
+                        outerProject()));
+    }
+
+    private DataStream<RowData> toDataStream(Source<RowData, ?, ?> source) {
+        DataStreamSource<RowData> dataStream =
+                env.fromSource(
+                        new PaimonDataStreamSource<>(source, table),
+                        watermarkStrategy == null
+                                ? WatermarkStrategy.noWatermarks()
+                                : watermarkStrategy,
+                        sourceName,
+                        produceTypeInfo());
+
+        String uidSuffix = table.options().get(SOURCE_OPERATOR_UID_SUFFIX.key());
+        if (!StringUtils.isNullOrWhitespaceOnly(uidSuffix)) {
+            dataStream =
+                    (DataStreamSource<RowData>)
+                            dataStream.uid(generateCustomUid(SOURCE_NAME, table.name(), uidSuffix));
+        }
+
+        if (parallelism != null) {
+            dataStream.setParallelism(parallelism);
+        }
+        return dataStream;
+    }
+
+    private TypeInformation<RowData> produceTypeInfo() {
+        RowType rowType = toLogicalType(table.rowType());
+        LogicalType produceType =
+                Optional.ofNullable(projectedFields)
+                        .map(Projection::of)
+                        .map(p -> p.project(rowType))
+                        .orElse(rowType);
+        return InternalTypeInfo.of(produceType);
+    }
+
+    private @Nullable org.apache.paimon.types.RowType projectedRowType() {
+        return Optional.ofNullable(projectedFields)
+                .map(Projection::of)
+                .map(p -> p.project(table.rowType()))
+                .orElse(null);
+    }
+
+    private @Nullable NestedProjectedRowData outerProject() {
+        return Optional.ofNullable(projectedFields)
+                .map(Projection::of)
+                .map(p -> p.getOuterProjectRow(table.rowType()))
+                .orElse(null);
+    }
+
+    @VisibleForTesting
+    public boolean isUnordered() {
+        return unordered;
+    }
+
+    /** Build source {@link DataStream} with {@link RowData}. */
+    public DataStream<Row> buildForRow() {
+        DataType rowType = fromLogicalToDataType(toLogicalType(table.rowType()));
+        DataType[] fieldDataTypes = rowType.getChildren().toArray(new DataType[0]);
+
+        DataFormatConverters.RowConverter converter =
+                new DataFormatConverters.RowConverter(fieldDataTypes);
+        DataStream<RowData> source = build();
+        SingleOutputStreamOperator<Row> result =
+                source.map((MapFunction<RowData, Row>) converter::toExternal)
+                        .returns(ExternalTypeInfo.of(rowType));
+        forwardParallelism(result, source);
+        return result;
+    }
+
+    /**
+     * Build a {@link Source} for APIs requiring a plain source instance, such as Flink's {@code
+     * HybridSource}. Different from {@link #build()}, no {@link StreamExecutionEnvironment} is
+     * required: boundedness is either inferred from the environment set via {@link
+     * #env(StreamExecutionEnvironment)} or must be specified with {@link #sourceBounded(boolean)}.
+     *
+     * <p>When a Paimon bounded source is the first (historical) segment of a {@code HybridSource}
+     * in a streaming job, {@code sourceBounded(true)} must be set explicitly, because {@link
+     * #env(StreamExecutionEnvironment)} infers unboundedness from a streaming environment.
+     *
+     * <p>Example:
+     *
+     * <pre>{@code
+     * Source<RowData, ?, ?> bounded =
+     *         new FlinkSourceBuilder(table).sourceBounded(true).buildSource();
+     * HybridSource<RowData> hybrid =
+     *         HybridSource.builder(bounded)
+     *                 .addSource(
+     *                         context ->
+     *                                 new FlinkSourceBuilder(table)
+     *                                         .sourceBounded(false)
+     *                                         .buildSource(),
+     *                         Boundedness.CONTINUOUS_UNBOUNDED)
+     *                 .build();
+     *
+     * // env is the StreamExecutionEnvironment the job runs on
+     * env.fromSource(
+     *         hybrid,
+     *         WatermarkStrategy.noWatermarks(),
+     *         "hybrid",
+     *         InternalTypeInfo.of(LogicalTypeConversion.toLogicalType(table.rowType())));
+     * }</pre>
+     *
+     * <p>The second (streaming) segment is created when {@code HybridSource} switches to it, and
+     * its start position is resolved at that moment. There is no hand-off with the bounded segment:
+     * {@code scan.mode=latest} reads only newer changes, so changes committed after the bounded
+     * segment planned its splits but before the switch are skipped; the default {@code latest-full}
+     * re-reads the whole table first, so nothing is lost but the bounded segment's data is
+     * duplicated.
+     *
+     * <p>Only the default static and continuous scan paths are supported; postpone merge-on-read,
+     * {@code scan.dedicated-split-generation}, {@code source.checkpoint-align.enabled} and
+     * exactly-once consumer mode rely on other topologies and require {@link #build()}. The
+     * exception is postpone merge-on-read with {@code scan.mode=compacted-full}, which reads
+     * through the static path.
+     *
+     * <p>{@link #sourceName(String)}, {@link #watermarkStrategy(WatermarkStrategy)}, {@link
+     * #sourceParallelism(Integer)} and the uid suffix option are ignored by this method; apply the
+     * source name and the watermark strategy in your {@code env.fromSource(...)} call, and the
+     * parallelism and uid on the resulting {@code DataStreamSource}. A job that relies on the uid
+     * suffix for state compatibility will not restore from state when switching to this method.
+     *
+     * <p>{@code HybridSource} does not implement {@code ResultTypeQueryable}, so the type
+     * information must be passed to {@code env.fromSource(...)} explicitly, for example {@code
+     * InternalTypeInfo.of(LogicalTypeConversion.toLogicalType(rowType))} where {@code rowType} is
+     * {@code table.rowType()}, or the projected row type if {@code projection(...)} is used. Note
+     * that {@code InternalTypeInfo} is a Flink internal API with no public alternative for {@code
+     * RowData} type information.
+     */
+    public Source<RowData, ?, ?> buildSource() {
+        return new PaimonDataStreamSource<>(createSource(), table);
+    }
+
+    /** Build source {@link DataStream} with {@link RowData}. */
+    public DataStream<RowData> build() {
+        if (env == null) {
+            throw new IllegalArgumentException("StreamExecutionEnvironment should not be null.");
+        }
+        checkConsumerId();
+
+        if (sourceBounded && PostponeMergeOnRead.configured(table)) {
+            DataStream<RowData> mergeSource = buildPostponeMergeSource();
+            if (mergeSource != null) {
+                return mergeSource;
+            }
+        }
+
+        if (sourceBounded) {
+            if (conf.get(FlinkConnectorOptions.SCAN_DEDICATED_SPLIT_GENERATION)) {
+                return buildDedicatedSplitGenSource(true);
+            }
+            return toDataStream(createSource());
+        }
+        TableScanUtils.streamingReadingValidate(table);
+
+        if (conf.get(FlinkConnectorOptions.SOURCE_CHECKPOINT_ALIGN_ENABLED)) {
+            if (conf.get(CoreOptions.CHAIN_TABLE_ENABLED)) {
+                throw new UnsupportedOperationException(
+                        "Chain table streaming is not compatible with checkpoint-align mode. "
+                                + "Please disable 'source.checkpoint-align.enabled' when reading "
+                                + "a chain table in streaming mode.");
+            }
+            return buildAlignedContinuousFileSource();
+        } else if (conf.contains(CoreOptions.CONSUMER_ID)
+                && conf.get(CoreOptions.CONSUMER_CONSISTENCY_MODE)
+                        == CoreOptions.ConsumerMode.EXACTLY_ONCE) {
+            return buildDedicatedSplitGenSource(false);
+        } else {
+            return toDataStream(createSource());
+        }
+    }
+
+    private DataStream<RowData> buildDedicatedSplitGenSource(boolean isBounded) {
+        DataStream<RowData> dataStream;
+        if (limit != null && !isBounded) {
+            throw new IllegalArgumentException(
+                    "Cannot limit streaming source, please use batch execution mode.");
+        }
+        ReadBuilder readBuilder = createReadBuilder(projectedRowType());
+        dataStream =
+                MonitorSource.buildSource(
+                        env,
+                        sourceName,
+                        produceTypeInfo(),
+                        readBuilder,
+                        conf.get(CoreOptions.CONTINUOUS_DISCOVERY_INTERVAL).toMillis(),
+                        watermarkStrategy == null,
+                        conf.get(FlinkConnectorOptions.READ_SHUFFLE_BUCKET_WITH_PARTITION),
+                        unordered,
+                        outerProject(),
+                        isBounded,
+                        limit,
+                        table,
+                        readBuilder.readType(),
+                        conf.get(CoreOptions.BLOB_AS_DESCRIPTOR));
+        if (parallelism != null) {
+            dataStream.getTransformation().setParallelism(parallelism);
+        }
+        if (watermarkStrategy != null) {
+            dataStream = dataStream.assignTimestampsAndWatermarks(watermarkStrategy);
+        }
+        return dataStream;
+    }
+
+    private void assertStreamingConfigurationForAlignMode(StreamExecutionEnvironment env) {
+        CheckpointConfig checkpointConfig = env.getCheckpointConfig();
+        checkArgument(
+                checkpointConfig.isCheckpointingEnabled(),
+                "The align mode of paimon source is only supported when checkpoint enabled. Please set "
+                        + "execution.checkpointing.interval larger than 0");
+        checkArgument(
+                checkpointConfig.getMaxConcurrentCheckpoints() == 1,
+                "The align mode of paimon source supports at most one ongoing checkpoint at the same time. Please set "
+                        + "execution.checkpointing.max-concurrent-checkpoints to 1");
+        checkArgument(
+                checkpointConfig.getCheckpointTimeout()
+                        > conf.get(FlinkConnectorOptions.SOURCE_CHECKPOINT_ALIGN_TIMEOUT)
+                                .toMillis(),
+                "The align mode of paimon source requires that the timeout of checkpoint is greater than the timeout of the source's snapshot alignment. Please increase "
+                        + "execution.checkpointing.timeout or decrease "
+                        + FlinkConnectorOptions.SOURCE_CHECKPOINT_ALIGN_TIMEOUT.key());
+        checkArgument(
+                !env.getCheckpointConfig().isUnalignedCheckpointsEnabled(),
+                "The align mode of paimon source currently does not support unaligned checkpoints. Please set "
+                        + "execution.checkpointing.unaligned.enabled to false.");
+        checkArgument(
+                env.getCheckpointConfig().getCheckpointingMode() == CheckpointingMode.EXACTLY_ONCE,
+                "The align mode of paimon source currently only supports EXACTLY_ONCE checkpoint mode. Please set "
+                        + "execution.checkpointing.mode to exactly-once");
+    }
+}

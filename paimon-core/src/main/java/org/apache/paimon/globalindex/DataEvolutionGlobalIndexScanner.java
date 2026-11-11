@@ -1,0 +1,567 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.globalindex;
+
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.globalindex.btree.BTreeGlobalIndexerFactory;
+import org.apache.paimon.globalindex.io.GlobalIndexFileReader;
+import org.apache.paimon.index.GlobalIndexMeta;
+import org.apache.paimon.index.IndexFileMeta;
+import org.apache.paimon.index.IndexPathFactory;
+import org.apache.paimon.manifest.IndexManifestEntry;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.partition.PartitionPredicate;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.TopN;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.Filter;
+import org.apache.paimon.utils.Range;
+import org.apache.paimon.utils.RoaringNavigableMap64;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.function.IntFunction;
+import java.util.stream.Collectors;
+
+import static org.apache.paimon.CoreOptions.GLOBAL_INDEX_THREAD_NUM;
+import static org.apache.paimon.predicate.PredicateVisitor.collectFieldIds;
+import static org.apache.paimon.table.source.snapshot.TimeTravelUtil.tryTravelOrLatest;
+import static org.apache.paimon.utils.Preconditions.checkNotNull;
+
+/** Scanner for shard-based global indexes on data-evolution tables. */
+public class DataEvolutionGlobalIndexScanner implements Closeable {
+
+    private static final int MAX_TOP_N_LIMIT = 100;
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(DataEvolutionGlobalIndexScanner.class);
+
+    private final Options options;
+    private final RowType rowType;
+    private final ExecutorService executor;
+    private final GlobalIndexEvaluator globalIndexEvaluator;
+    private final IndexPathFactory indexPathFactory;
+    private final DataEvolutionGlobalIndexCoverage coverage;
+    private final FileStoreTable table;
+    private final List<IndexFileMeta> indexFiles;
+    private final FileIO fileIO;
+
+    private DataEvolutionGlobalIndexScanner(
+            FileStoreTable table,
+            @Nullable Snapshot snapshot,
+            @Nullable PartitionPredicate partitionFilter,
+            Options options,
+            RowType rowType,
+            FileIO fileIO,
+            IndexPathFactory indexPathFactory,
+            Collection<IndexFileMeta> indexFiles) {
+        this(
+                table,
+                snapshot,
+                partitionFilter,
+                options,
+                rowType,
+                fileIO,
+                indexPathFactory,
+                indexFiles,
+                indexFiles);
+    }
+
+    private DataEvolutionGlobalIndexScanner(
+            FileStoreTable table,
+            @Nullable Snapshot snapshot,
+            @Nullable PartitionPredicate partitionFilter,
+            Options options,
+            RowType rowType,
+            FileIO fileIO,
+            IndexPathFactory indexPathFactory,
+            Collection<IndexFileMeta> coverageIndexFiles,
+            Collection<IndexFileMeta> indexFiles) {
+        this.table = table;
+        this.indexFiles = new ArrayList<>(indexFiles);
+        this.fileIO = fileIO;
+        this.options = options;
+        this.rowType = rowType;
+        this.executor =
+                GlobalIndexReadThreadPool.getExecutorService(options.get(GLOBAL_INDEX_THREAD_NUM));
+        this.indexPathFactory = indexPathFactory;
+        this.coverage =
+                new DataEvolutionGlobalIndexCoverage(
+                        table,
+                        snapshot,
+                        partitionFilter,
+                        coverageIndexFiles,
+                        table.coreOptions().scalarIndexSearchMode());
+        GlobalIndexFileReader indexFileReader = meta -> fileIO.newInputStream(meta.filePath());
+        Map<Integer, List<IndexMetaFileGroup>> groupsByField = groupIndexFiles(indexFiles);
+        IntFunction<Collection<GlobalIndexReader>> readersFunction =
+                fId -> {
+                    List<IndexMetaFileGroup> groups =
+                            groupsByField.getOrDefault(fId, Collections.emptyList());
+                    if (groups.isEmpty()) {
+                        return Collections.emptyList();
+                    }
+
+                    List<GlobalIndexReader> allReaders = new ArrayList<>();
+                    for (IndexMetaFileGroup indexGroup : groups) {
+                        allReaders.addAll(createReaders(indexFileReader, indexGroup, rowType));
+                    }
+                    return Collections.singletonList(new UnionGlobalIndexReader(allReaders));
+                };
+        this.globalIndexEvaluator = new GlobalIndexEvaluator(rowType, readersFunction);
+    }
+
+    /** Groups metadata for both planning-time readers and reader-side query plans. */
+    static Map<Integer, List<IndexMetaFileGroup>> groupIndexFiles(
+            Collection<IndexFileMeta> indexFiles) {
+        Map<List<Integer>, IndexMetaFileGroup> primaryGroups = new LinkedHashMap<>();
+        for (IndexFileMeta indexFile : indexFiles) {
+            GlobalIndexMeta meta = checkNotNull(indexFile.globalIndexMeta());
+            int indexFieldId = meta.indexFieldId();
+            List<Integer> fieldIds = meta.getIndexedFieldIds();
+            IndexMetaFileGroup group = primaryGroups.get(fieldIds);
+            if (group == null) {
+                group = new IndexMetaFileGroup(indexFieldId, fieldIds);
+                primaryGroups.put(fieldIds, group);
+            }
+            group.addFile(indexFile.indexType(), meta.rowRange(), indexFile);
+        }
+
+        Map<Integer, List<IndexMetaFileGroup>> groupsByField = new HashMap<>();
+        for (IndexMetaFileGroup group : primaryGroups.values()) {
+            groupsByField.computeIfAbsent(group.indexFieldId, k -> new ArrayList<>()).add(group);
+        }
+        for (IndexMetaFileGroup group : primaryGroups.values()) {
+            for (int fieldId : group.fieldIds.subList(1, group.fieldIds.size())) {
+                List<IndexMetaFileGroup> groups =
+                        groupsByField.computeIfAbsent(fieldId, k -> new ArrayList<>());
+                if (!groups.contains(group)) {
+                    groups.add(group);
+                }
+            }
+        }
+        return groupsByField;
+    }
+
+    /** All index files of one global index (single- or multi-column), grouped for reading. */
+    static class IndexMetaFileGroup {
+
+        private final int indexFieldId;
+        private final List<Integer> fieldIds;
+        private final Map<String, Map<Range, List<IndexFileMeta>>> metas = new HashMap<>();
+
+        IndexMetaFileGroup(int indexFieldId, List<Integer> fieldIds) {
+            this.indexFieldId = indexFieldId;
+            this.fieldIds = fieldIds;
+        }
+
+        void addFile(String indexType, Range range, IndexFileMeta indexFile) {
+            metas.computeIfAbsent(indexType, k -> new HashMap<>())
+                    .computeIfAbsent(range, k -> new ArrayList<>())
+                    .add(indexFile);
+        }
+
+        Map<String, Map<Range, List<IndexFileMeta>>> metas() {
+            return metas;
+        }
+
+        /** The primary index column. */
+        DataField indexField(RowType rowType) {
+            return rowType.getField(indexFieldId);
+        }
+
+        /** The extra columns beyond the primary one; empty for a single-column index. */
+        List<DataField> extraFields(RowType rowType) {
+            return fieldIds.subList(1, fieldIds.size()).stream()
+                    .map(rowType::getField)
+                    .collect(Collectors.toList());
+        }
+    }
+
+    public static Optional<DataEvolutionGlobalIndexScanner> create(
+            FileStoreTable table, Collection<IndexFileMeta> indexFiles) {
+        return create(table, null, null, indexFiles);
+    }
+
+    /** Search pre-filters use per-column coverage, so they require single-field definitions. */
+    public static Optional<DataEvolutionGlobalIndexScanner> createForScalarFilters(
+            FileStoreTable table,
+            @Nullable Snapshot pinnedSnapshot,
+            @Nullable PartitionPredicate partitionFilter,
+            Collection<IndexFileMeta> indexFiles) {
+        return create(
+                table,
+                pinnedSnapshot,
+                partitionFilter,
+                indexFiles.stream()
+                        .filter(file -> !isMultiFieldIndex(file))
+                        .collect(Collectors.toList()));
+    }
+
+    public static Optional<DataEvolutionGlobalIndexScanner> create(
+            FileStoreTable table,
+            @Nullable Snapshot pinnedSnapshot,
+            @Nullable PartitionPredicate partitionFilter,
+            Collection<IndexFileMeta> indexFiles) {
+        List<IndexFileMeta> globalIndexFiles =
+                globalIndexFiles(indexFiles).stream()
+                        .filter(file -> isIndexInSchema(table.rowType(), file))
+                        .collect(Collectors.toList());
+        if (globalIndexFiles.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                new DataEvolutionGlobalIndexScanner(
+                        table,
+                        pinnedSnapshot != null ? pinnedSnapshot : tryTravelOrLatest(table),
+                        partitionFilter,
+                        table.coreOptions().toConfiguration(),
+                        table.rowType(),
+                        table.fileIO(),
+                        table.store().pathFactory().globalIndexFileFactory(),
+                        globalIndexFiles));
+    }
+
+    public static Optional<DataEvolutionGlobalIndexScanner> create(
+            FileStoreTable table,
+            @Nullable PartitionPredicate partitionFilter,
+            @Nullable Predicate filter) {
+        @Nullable Snapshot snapshot = tryTravelOrLatest(table);
+        List<IndexFileMeta> indexFiles =
+                table.store().newIndexFileHandler()
+                        .scan(snapshot, indexFileFilter(table, partitionFilter, filter)).stream()
+                        .map(IndexManifestEntry::indexFile)
+                        .collect(Collectors.toList());
+        if (indexFiles.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(
+                new DataEvolutionGlobalIndexScanner(
+                        table,
+                        snapshot,
+                        partitionFilter,
+                        table.coreOptions().toConfiguration(),
+                        table.rowType(),
+                        table.fileIO(),
+                        table.store().pathFactory().globalIndexFileFactory(),
+                        indexFiles));
+    }
+
+    /**
+     * Creates a scanner for a single-column TopN backed by a primary BTree index.
+     *
+     * <p>Indexes carrying the ordered field only as an extra field are not ordered by that field
+     * and cannot serve this scan.
+     */
+    public static Optional<DataEvolutionGlobalIndexScanner> createForTopN(
+            FileStoreTable table, @Nullable PartitionPredicate partitionFilter, TopN topN) {
+        if (!isSupportedTopN(topN)) {
+            return Optional.empty();
+        }
+
+        DataField indexField = table.rowType().getField(topN.orders().get(0).field().name());
+        int fieldId = indexField.id();
+        @Nullable Snapshot snapshot = tryTravelOrLatest(table);
+        List<IndexFileMeta> indexFiles =
+                table.store().newIndexFileHandler()
+                        .scan(snapshot, topNIndexFileFilter(partitionFilter, fieldId)).stream()
+                        .map(IndexManifestEntry::indexFile)
+                        .collect(Collectors.toList());
+        if (indexFiles.isEmpty()) {
+            return Optional.empty();
+        }
+        List<IndexFileMeta> selectedIndexFiles =
+                BTreeTopNIndexFileSelector.select(indexFiles, indexField, topN);
+        return Optional.of(
+                new DataEvolutionGlobalIndexScanner(
+                        table,
+                        snapshot,
+                        partitionFilter,
+                        table.coreOptions().toConfiguration(),
+                        table.rowType(),
+                        table.fileIO(),
+                        table.store().pathFactory().globalIndexFileFactory(),
+                        indexFiles,
+                        selectedIndexFiles));
+    }
+
+    private static boolean isSupportedTopN(TopN topN) {
+        return topN != null
+                && topN.limit() >= 0
+                && topN.limit() <= MAX_TOP_N_LIMIT
+                && topN.orders().size() == 1;
+    }
+
+    private static Filter<IndexManifestEntry> topNIndexFileFilter(
+            @Nullable PartitionPredicate partitionFilter, int fieldId) {
+        return entry -> {
+            if (partitionFilter != null && !partitionFilter.test(entry.partition())) {
+                return false;
+            }
+            IndexFileMeta indexFile = entry.indexFile();
+            GlobalIndexMeta globalIndex = indexFile.globalIndexMeta();
+            return globalIndex != null
+                    && globalIndex.indexFieldId() == fieldId
+                    && (globalIndex.extraFieldIds() == null
+                            || globalIndex.extraFieldIds().length == 0)
+                    && BTreeGlobalIndexerFactory.IDENTIFIER.equals(indexFile.indexType());
+        };
+    }
+
+    static Filter<IndexManifestEntry> indexFileFilter(
+            FileStoreTable table,
+            @Nullable PartitionPredicate partitionFilter,
+            @Nullable Predicate filter) {
+        if (filter == null) {
+            return entry -> false;
+        }
+        Set<Integer> filterFieldIds = collectFieldIds(table.rowType(), filter);
+        Filter<IndexManifestEntry> indexFileFilter =
+                entry -> {
+                    if (partitionFilter != null && !partitionFilter.test(entry.partition())) {
+                        return false;
+                    }
+                    GlobalIndexMeta globalIndex = entry.indexFile().globalIndexMeta();
+                    if (globalIndex == null
+                            || !isIndexInSchema(table.rowType(), entry.indexFile())) {
+                        return false;
+                    }
+                    // Collect indexes whose primary column is filtered, and also multi-column
+                    // indexes that have a filtered column as an extra.
+                    if (filterFieldIds.contains(globalIndex.indexFieldId())) {
+                        return true;
+                    }
+                    if (globalIndex.extraFieldIds() != null) {
+                        for (int id : globalIndex.extraFieldIds()) {
+                            if (filterFieldIds.contains(id)) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                };
+        return indexFileFilter;
+    }
+
+    private static boolean isMultiFieldIndex(IndexFileMeta file) {
+        GlobalIndexMeta meta = file.globalIndexMeta();
+        return meta != null && meta.extraFieldIds() != null && meta.extraFieldIds().length > 0;
+    }
+
+    /** Dropped indexed columns leave manifest entries that cannot serve the current schema. */
+    static boolean isIndexInSchema(RowType rowType, IndexFileMeta file) {
+        return file.globalIndexMeta().getIndexedFieldIds().stream()
+                .allMatch(rowType::containsField);
+    }
+
+    private static List<IndexFileMeta> globalIndexFiles(Collection<IndexFileMeta> indexFiles) {
+        return indexFiles.stream()
+                .filter(indexFile -> indexFile.globalIndexMeta() != null)
+                .collect(Collectors.toList());
+    }
+
+    public Optional<GlobalIndexResult> scan(Predicate predicate) {
+        return scanWithCoverage(predicate).map(GlobalIndexEvaluator.Evaluation::result);
+    }
+
+    public Optional<GlobalIndexEvaluator.Evaluation> scanWithCoverage(Predicate predicate) {
+        GlobalIndexQuery query =
+                predicate == null
+                                || indexFiles.stream()
+                                        .noneMatch(
+                                                DataEvolutionGlobalIndexScanner::isMultiFieldIndex)
+                        ? null
+                        : GlobalIndexQuery.create(
+                                rowType, predicate, indexFiles, indexPathFactory, options);
+        if (query != null && query.hasCompositeQuery()) {
+            try {
+                return query.evaluateWithCoverage(
+                        fileIO,
+                        options,
+                        indexFiles.stream()
+                                .map(file -> file.globalIndexMeta().rowRange())
+                                .collect(Collectors.toList()));
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to evaluate composite global index query", e);
+            }
+        }
+        return globalIndexEvaluator.evaluateWithContributingFields(predicate);
+    }
+
+    public Optional<GlobalIndexResult> scan(TopN topN) {
+        if (!isSupportedTopN(topN)) {
+            return Optional.empty();
+        }
+        if (topN.limit() == 0) {
+            return Optional.of(GlobalIndexResult.createEmpty());
+        }
+        String fieldName = topN.orders().get(0).field().name();
+        if (!rowType.containsField(fieldName)) {
+            return Optional.empty();
+        }
+        return globalIndexEvaluator.evaluateTopN(topN);
+    }
+
+    public GlobalIndexResult unindexedRows(Predicate predicate) {
+        RoaringNavigableMap64 rows = new RoaringNavigableMap64();
+        GlobalIndexQuery query =
+                predicate == null
+                        ? null
+                        : GlobalIndexQuery.create(
+                                rowType, predicate, indexFiles, indexPathFactory, options);
+        if (query != null && query.hasCompositeQuery() && query.hasScalarQuery()) {
+            // Scalar shards can decline a predicate at runtime, so the legacy API must use
+            // evaluated coverage as well. Internal callers retain the evaluation directly.
+            Optional<GlobalIndexEvaluator.Evaluation> evaluation = scanWithCoverage(predicate);
+            return evaluation.isPresent()
+                    ? unindexedRowsForEvaluation(evaluation.get())
+                    : GlobalIndexResult.fromRanges(
+                            coverage.unindexedRangesFromCoverage(Collections.emptyList(), null));
+        }
+        List<Range> unindexed =
+                query != null && query.hasCompositeQuery()
+                        ? coverage.unindexedRangesFromCoverage(query.coveredRanges(), null)
+                        : coverage.unindexedRanges(rowType, predicate);
+        for (Range range : unindexed) {
+            rows.addRange(range);
+        }
+        return GlobalIndexResult.create(rows);
+    }
+
+    public GlobalIndexResult unindexedRowsForEvaluation(
+            GlobalIndexEvaluator.Evaluation evaluation) {
+        if (evaluation.coveredRanges() == null) {
+            return unindexedRowsForContributingFields(evaluation.contributingFieldIds());
+        }
+        return GlobalIndexResult.fromRanges(
+                coverage.unindexedRangesFromCoverage(evaluation.coveredRanges(), null));
+    }
+
+    public GlobalIndexResult unindexedRowsForContributingFields(
+            Collection<Integer> contributingFieldIds) {
+        RoaringNavigableMap64 rows = new RoaringNavigableMap64();
+        for (Range range : coverage.unindexedRanges(contributingFieldIds, null)) {
+            rows.addRange(range);
+        }
+        return GlobalIndexResult.create(rows);
+    }
+
+    public GlobalIndexResult unindexedRows(TopN topN) {
+        String fieldName = topN.orders().get(0).field().name();
+        RoaringNavigableMap64 rows = new RoaringNavigableMap64();
+        for (Range range : coverage.unindexedRanges(rowType.getField(fieldName).id())) {
+            rows.addRange(range);
+        }
+        return GlobalIndexResult.create(rows);
+    }
+
+    private Collection<GlobalIndexReader> createReaders(
+            GlobalIndexFileReader indexFileReadWrite, IndexMetaFileGroup group, RowType rowType) {
+        List<DataField> indexFields =
+                group.fieldIds.stream().map(rowType::getField).collect(Collectors.toList());
+        if (indexFields.size() > 1) {
+            return Collections.emptyList();
+        }
+
+        Set<GlobalIndexReader> readers = new HashSet<>();
+        for (Map.Entry<String, Map<Range, List<IndexFileMeta>>> entry : group.metas.entrySet()) {
+            String indexType = entry.getKey();
+            Map<Range, List<IndexFileMeta>> metas = entry.getValue();
+            GlobalIndexer globalIndexer = GlobalIndexer.create(indexType, indexFields, options);
+
+            List<CompletableFuture<GlobalIndexReader>> futures = new ArrayList<>(metas.size());
+            for (Map.Entry<Range, List<IndexFileMeta>> rangeMetas : metas.entrySet()) {
+                Range range = rangeMetas.getKey();
+                List<IndexFileMeta> indexFileMetas = rangeMetas.getValue();
+                List<GlobalIndexIOMeta> globalMetas =
+                        indexFileMetas.stream()
+                                .map(meta -> toGlobalMeta(meta, indexPathFactory))
+                                .collect(Collectors.toList());
+                futures.add(
+                        CompletableFuture.supplyAsync(
+                                () ->
+                                        new OffsetGlobalIndexReader(
+                                                globalIndexer.createReader(
+                                                        indexFileReadWrite,
+                                                        globalMetas,
+                                                        range.count(),
+                                                        null,
+                                                        executor),
+                                                range.from,
+                                                range.to),
+                                executor));
+            }
+
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            List<GlobalIndexReader> unionReader = new ArrayList<>(futures.size() + 1);
+            for (CompletableFuture<GlobalIndexReader> future : futures) {
+                unionReader.add(future.join());
+            }
+            readers.add(
+                    new UnionGlobalIndexReader(
+                            unionReader,
+                            duration ->
+                                    LOG.info(
+                                            "Global index lookup table='{}', type='{}', fields='{}', lookup={} ms.",
+                                            table.name(),
+                                            indexType,
+                                            group.fieldIds.stream()
+                                                    .map(rowType::getField)
+                                                    .map(DataField::name)
+                                                    .collect(Collectors.toList()),
+                                            duration / 1_000_000)));
+        }
+
+        return readers;
+    }
+
+    static GlobalIndexIOMeta toGlobalMeta(IndexFileMeta meta, IndexPathFactory indexPathFactory) {
+        GlobalIndexMeta globalIndex = meta.globalIndexMeta();
+        checkNotNull(globalIndex);
+        Path filePath = indexPathFactory.toPath(meta);
+        return new GlobalIndexIOMeta(
+                filePath, meta.fileSize(), meta.rowCount(), globalIndex.indexMeta());
+    }
+
+    @Override
+    public void close() throws IOException {
+        globalIndexEvaluator.close();
+    }
+}

@@ -1,0 +1,416 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.spark.sql
+
+import org.apache.paimon.data.{InternalRow => PaimonRow}
+import org.apache.paimon.disk.IOManager
+import org.apache.paimon.reader.RecordReader
+import org.apache.paimon.reader.RecordReader.RecordIterator
+import org.apache.paimon.spark.{PaimonInputPartition, PaimonPartitionReader, PaimonRecordReaderIterator, PaimonSparkTestBase}
+import org.apache.paimon.spark.PaimonMetrics.{RESULTED_TABLE_FILES, SCANNED_SNAPSHOT_ID, SKIPPED_TABLE_FILES}
+import org.apache.paimon.spark.metric.SparkMetricRegistry
+import org.apache.paimon.spark.read.PaimonSplitScan
+import org.apache.paimon.spark.util.ScanPlanHelper
+import org.apache.paimon.table.source.{DataSplit, ReadBuilder, Split, TableRead}
+import org.apache.paimon.types.{DataTypes, RowType}
+
+import org.apache.spark.metrics.source.PaimonMetricsSource
+import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.PaimonUtils.createDataset
+import org.apache.spark.sql.connector.metric.CustomTaskMetric
+import org.apache.spark.sql.execution.CommandResultExec
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
+import org.apache.spark.sql.execution.metric.SQLMetric
+import org.apache.spark.sql.paimon.Utils
+import org.junit.jupiter.api.Assertions
+import org.mockito.ArgumentMatchers.any
+import org.mockito.Mockito.{doThrow, mock, times, verify, when}
+
+import javax.management.ObjectName
+
+import java.io.IOException
+import java.lang.management.ManagementFactory
+
+class PaimonMetricTest extends PaimonSparkTestBase with ScanPlanHelper {
+
+  test("read batch time includes the first batch") {
+    val reader = timedReader()
+    val iterator = PaimonRecordReaderIterator(reader, Seq.empty, mock(classOf[Split]))
+    try {
+      assert(iterator.readBatchTimeMs >= 20L)
+    } finally {
+      iterator.close()
+    }
+  }
+
+  test("read batch time includes active splits without counting them again on close") {
+    for (earlyClose <- Seq(true, false); failClose <- Seq(false, true)) {
+      val inputs = Seq(timedReader(), timedReader())
+      if (failClose) {
+        doThrow(new IOException("close failed"))
+          .doNothing()
+          .when(inputs.last)
+          .close()
+      }
+      val splits = inputs.map(_ => mock(classOf[Split]))
+      val read = mock(classOf[TableRead])
+      when(read.withIOManager(any(classOf[IOManager]))).thenReturn(read)
+      splits.zip(inputs).foreach {
+        case (split, input) => when(read.createReader(split)).thenReturn(input)
+      }
+      val builder = mock(classOf[ReadBuilder])
+      when(builder.readType()).thenReturn(RowType.of(DataTypes.INT()))
+      when(builder.newRead()).thenReturn(read)
+      val reader = PaimonPartitionReader(
+        builder,
+        PaimonInputPartition(splits),
+        Seq.empty,
+        true,
+        null,
+        Array.empty)
+      def readTime: Long = metric(reader.currentMetricsValues(), "readBatchTime")
+      try {
+        assert(reader.next() && reader.get().getInt(0) == 1)
+        val first = readTime
+        assert(first >= 20L)
+        assert(readTime == first)
+        assert(reader.next() && reader.get().getInt(0) == 2)
+        assert(reader.next() && reader.get().getInt(0) == 1)
+        assert(readTime >= first + 20L)
+        if (!earlyClose) {
+          assert(reader.next() && reader.get().getInt(0) == 2)
+          if (failClose) intercept[IOException](reader.next())
+          else assert(!reader.next())
+        }
+        val beforeClose = readTime
+        assert(beforeClose >= first + 20L)
+        if (earlyClose && failClose) {
+          intercept[IOException](reader.close())
+          assert(readTime == beforeClose)
+        }
+        reader.close()
+        assert(readTime == beforeClose)
+        reader.close()
+        assert(readTime == beforeClose)
+        verify(inputs.head).close()
+        verify(inputs.last, times(if (failClose) 2 else 1)).close()
+      } finally {
+        reader.close()
+      }
+    }
+  }
+
+  private def timedReader(): RecordReader[PaimonRow] = {
+    val batch = mock(classOf[RecordIterator[PaimonRow]])
+    when(batch.next()).thenReturn(GenericRow.of(1), GenericRow.of(2), null)
+    val reader = mock(classOf[RecordReader[PaimonRow]])
+    when(reader.readBatch())
+      .thenAnswer {
+        _ =>
+          Thread.sleep(25)
+          batch
+      }
+      .thenReturn(null)
+    reader
+  }
+
+  test("Paimon Metric: registered metrics are exposed through JMX") {
+    val tableName = "jmx-metric-test-" + System.nanoTime()
+    val registry = SparkMetricRegistry()
+    val group = registry.createTableMetricGroup("commit", tableName)
+    group.gauge("lastCommitDuration", () => 42L)
+    val counter = group.counter("recordsWritten")
+    counter.inc(3)
+    val histogram = group.histogram("commitDuration", 10)
+    histogram.update(7)
+
+    val server = ManagementFactory.getPlatformMBeanServer
+    val names = server.queryNames(new ObjectName("paimon:*"), null)
+    val metricName = names.toArray.collectFirst {
+      case name: ObjectName
+          if name.toString.contains(tableName) &&
+            name.toString.contains("lastCommitDuration") =>
+        name
+    }
+    assert(metricName.isDefined, s"JMX metric missing for $tableName: $names")
+    assert(server.getAttribute(metricName.get, "Value") == 42L)
+    assert(group.getMetrics.get("lastCommitDuration") != null)
+
+    val counterName = names.toArray.collectFirst {
+      case name: ObjectName
+          if name.toString.contains(tableName) &&
+            name.toString.contains("recordsWritten") =>
+        name
+    }.get
+    assert(server.getAttribute(counterName, "Value") == 3L)
+    val histogramName = names.toArray.collectFirst {
+      case name: ObjectName
+          if name.toString.contains(tableName) &&
+            name.toString.contains("commitDuration") =>
+        name
+    }.get
+    assert(server.getAttribute(histogramName, "Value") == 7.0)
+
+    val metricCount = PaimonMetricsSource.metricRegistry.getMetrics.size()
+    val nextGroup = registry.createTableMetricGroup("commit", tableName)
+    nextGroup.gauge("lastCommitDuration", () => 99L)
+    assert(server.getAttribute(metricName.get, "Value") == 99L)
+    assert(PaimonMetricsSource.metricRegistry.getMetrics.size() == metricCount)
+  }
+
+  test("Paimon Metric: V1 commit metrics are exposed through JMX") {
+    withSparkSQLConf("spark.paimon.write.use-v2-write" -> "false") {
+      withTable("T_V1_JMX") {
+        sql("CREATE TABLE T_V1_JMX (id INT)")
+        sql("INSERT INTO T_V1_JMX VALUES (1), (2)")
+
+        val server = ManagementFactory.getPlatformMBeanServer
+        val names = server.queryNames(new ObjectName("paimon:*"), null)
+        val commitMetric = names.toArray.collectFirst {
+          case name: ObjectName
+              if name.toString.toLowerCase.contains("t_v1_jmx") &&
+                name.toString.contains("lastTableFilesAdded") =>
+            name
+        }
+        assert(commitMetric.isDefined, s"V1 commit JMX metric missing: $names")
+        assert(server.getAttribute(commitMetric.get, "Value").asInstanceOf[Long] > 0L)
+      }
+    }
+  }
+
+  test(s"Paimon Metric: scan driver metric") {
+    // Spark support reportDriverMetrics since Spark 3.4
+    if (gteqSpark3_4) {
+      sql(s"""
+             |CREATE TABLE T (id INT, name STRING, pt STRING)
+             |TBLPROPERTIES ('bucket'='1', 'bucket-key'='id', 'write-only'='true')
+             |PARTITIONED BY (pt)
+             |""".stripMargin)
+
+      sql(s"INSERT INTO T VALUES (1, 'a', 'p1'), (2, 'b', 'p2')")
+      sql(s"INSERT INTO T VALUES (3, 'c', 'p2'), (4, 'c', 'p3')")
+      sql(s"INSERT INTO T VALUES (5, 'd', 'p2')")
+
+      def checkMetrics(
+          s: String,
+          scannedSnapshotId: Long,
+          skippedTableFiles: Long,
+          resultedTableFiles: Long): Unit = {
+        val scan = getPaimonScan(s)
+        // call getInputPartitions to trigger scan
+        scan.inputPartitions
+        val metrics = scan.reportDriverMetrics()
+        Assertions.assertEquals(scannedSnapshotId, metric(metrics, SCANNED_SNAPSHOT_ID))
+        Assertions.assertEquals(skippedTableFiles, metric(metrics, SKIPPED_TABLE_FILES))
+        Assertions.assertEquals(resultedTableFiles, metric(metrics, RESULTED_TABLE_FILES))
+      }
+
+      checkMetrics(s"SELECT * FROM T", 3, 0, 5)
+      checkMetrics(s"SELECT * FROM T WHERE pt = 'p2'", 3, 2, 3)
+
+      sql(s"DELETE FROM T WHERE pt = 'p1'")
+      checkMetrics(s"SELECT * FROM T", 4, 0, 4)
+
+      sql("CALL sys.compact(table => 'T', partitions => 'pt=\"p2\"')")
+      checkMetrics(s"SELECT * FROM T", 5, 0, 2)
+      checkMetrics(s"SELECT * FROM T WHERE pt = 'p2'", 5, 1, 1)
+    }
+  }
+
+  test(s"Paimon Metric: split scan driver metric") {
+    // Spark support reportDriverMetrics since Spark 3.4
+    if (gteqSpark3_4) {
+      sql("CREATE TABLE T (id INT, name STRING)")
+      sql(s"INSERT INTO T VALUES (1, 'a'), (2, 'b')")
+      sql(s"INSERT INTO T VALUES (3, 'c')")
+
+      val splits = getPaimonScan("SELECT * FROM T").inputSplits.map(_.asInstanceOf[DataSplit])
+      val df = createDataset(spark, createNewScanPlan(splits, createRelationV2("T")))
+      val scan = df.queryExecution.optimizedPlan
+        .collectFirst { case relation: DataSourceV2ScanRelation => relation }
+        .get
+        .scan
+        .asInstanceOf[PaimonSplitScan]
+
+      val metrics = scan.reportDriverMetrics()
+      assert(metric(metrics, RESULTED_TABLE_FILES) == 3)
+    }
+  }
+
+  test("Paimon Metric: report output metric") {
+    for (useV2Write <- Seq("true", "false")) {
+      withSparkSQLConf("spark.paimon.write.use-v2-write" -> useV2Write) {
+        withTable("T") {
+          sql(s"CREATE TABLE T (id int)")
+
+          var recordsWritten = 0L
+          var bytesWritten = 0L
+
+          val listener = new SparkListener() {
+            override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = {
+              val outputMetrics = taskEnd.taskMetrics.outputMetrics
+              recordsWritten += outputMetrics.recordsWritten
+              bytesWritten += outputMetrics.bytesWritten
+            }
+          }
+
+          try {
+            spark.sparkContext.addSparkListener(listener)
+            sql(s"INSERT INTO T VALUES 1, 2, 3")
+            Utils.waitUntilEventEmpty(spark)
+          } finally {
+            spark.sparkContext.removeSparkListener(listener)
+          }
+
+          Assertions.assertEquals(3, recordsWritten)
+          Assertions.assertTrue(bytesWritten > 0)
+        }
+      }
+    }
+  }
+
+  test(s"Paimon Metric: v2 write metric") {
+    withSparkSQLConf("spark.paimon.write.use-v2-write" -> "true") {
+      sql("CREATE TABLE T (id INT, name STRING, pt STRING) PARTITIONED BY (pt)")
+      val df = sql(s"INSERT INTO T VALUES (1, 'a', 'p1'), (2, 'b', 'p2')")
+      val metrics = commandMetrics(df)
+      val executionMetrics = commandExecutionMetrics(metrics)
+
+      assert(executionMetrics(metrics("addedTableFiles").id) == "2")
+      assert(executionMetrics(metrics("insertedRecords").id) == "2")
+      assert(executionMetrics(metrics("partitionsWritten").id) == "2")
+    }
+  }
+
+  test(s"Paimon Metric: v2 write metric with adaptive plan") {
+    withSparkSQLConf("spark.paimon.write.use-v2-write" -> "true") {
+      sql("CREATE TABLE T (id INT, pt INT) PARTITIONED BY (pt)")
+      val df = sql(s"INSERT INTO T SELECT /*+ REPARTITION(1) */ id, id FROM range(1, 10)")
+      val metrics = commandMetrics(df)
+      val executionMetrics = commandExecutionMetrics(metrics)
+
+      assert(executionMetrics(metrics("addedTableFiles").id) == "9")
+      assert(executionMetrics(metrics("insertedRecords").id) == "9")
+      assert(executionMetrics(metrics("partitionsWritten").id) == "9")
+    }
+  }
+
+  test(s"Paimon Metric: insert bucket table") {
+    withSparkSQLConf("spark.paimon.write.use-v2-write" -> "true") {
+      sql("CREATE TABLE T (id INT, v INT) TBLPROPERTIES ('bucket'='3', 'bucket-key'='id')")
+      val df = sql(s"INSERT INTO T SELECT /*+ REPARTITION(1) */ id, id as v FROM range(0, 100)")
+      val metrics = commandMetrics(df)
+      val executionMetrics = commandExecutionMetrics(metrics)
+      assert(executionMetrics(metrics("addedTableFiles").id) == "3")
+      assert(executionMetrics(metrics("bucketsWritten").id) == "3")
+    }
+  }
+
+  test(s"Paimon Metric: insert overwrite") {
+    withSparkSQLConf("spark.paimon.write.use-v2-write" -> "true") {
+      sql("CREATE TABLE T (id INT, v INT)")
+      sql(s"INSERT INTO T SELECT /*+ REPARTITION(1) */ id, id as v FROM range(0, 10)")
+      val df =
+        sql(s"INSERT OVERWRITE T SELECT /*+ REPARTITION(1) */ id, id as v FROM range(0, 100)")
+      val metrics = commandMetrics(df)
+      val executionMetrics = commandExecutionMetrics(metrics)
+      assert(executionMetrics(metrics("addedTableFiles").id) == "1")
+      assert(executionMetrics(metrics("insertedRecords").id) == "100")
+    }
+  }
+
+  test(s"Paimon Metric: delete") {
+    withSparkSQLConf("spark.paimon.write.use-v2-write" -> "true") {
+      sql("CREATE TABLE T (id INT, v INT)")
+      sql(s"INSERT INTO T SELECT /*+ REPARTITION(1) */ id, id as v FROM range(0, 10)")
+      val df = sql("DELETE FROM T WHERE id < 3")
+      val metrics = commandMetrics(df)
+      val executionMetrics = commandExecutionMetrics(metrics)
+      assert(executionMetrics(metrics("addedTableFiles").id) == "1")
+      assert(executionMetrics(metrics("deletedTableFiles").id) == "1")
+      assert(executionMetrics(metrics("deletedRecords").id) == "3")
+
+      val df1 = sql("DELETE FROM T WHERE id > 0")
+      val metrics1 = commandMetrics(df1)
+      val executionMetrics1 = commandExecutionMetrics(metrics1)
+      assert(executionMetrics1(metrics1("addedTableFiles").id) == "0")
+      assert(executionMetrics1(metrics1("deletedTableFiles").id) == "1")
+      assert(executionMetrics1(metrics1("deletedRecords").id) == "7")
+    }
+  }
+
+  test(s"Paimon Metric: delta row-level operation record metrics") {
+    withSparkSQLConf("spark.paimon.write.use-v2-write" -> "true") {
+      sql("CREATE TABLE T (id INT, v INT) TBLPROPERTIES ('deletion-vectors.enabled' = 'true')")
+      sql(s"INSERT INTO T SELECT /*+ REPARTITION(1) */ id, id as v FROM range(0, 10)")
+
+      val deleteDf = sql("DELETE FROM T WHERE id < 3")
+      val deleteMetrics = commandMetrics(deleteDf)
+      val deleteExecutionMetrics = commandExecutionMetrics(deleteMetrics)
+      assert(deleteExecutionMetrics(deleteMetrics("deletedRecords").id) == "3")
+
+      val updateDf = sql("UPDATE T SET v = v + 1 WHERE id >= 8")
+      val updateMetrics = commandMetrics(updateDf)
+      val updateExecutionMetrics = commandExecutionMetrics(updateMetrics)
+      assert(updateExecutionMetrics(updateMetrics("updatedRecords").id) == "2")
+
+      val mergeDf = sql("""
+                          |MERGE INTO T
+                          |USING (SELECT * FROM VALUES (3, 30), (4, 40), (100, 1) AS s(id, v)) s
+                          |ON T.id = s.id
+                          |WHEN MATCHED AND s.id = 3 THEN UPDATE SET T.v = s.v
+                          |WHEN MATCHED AND s.id = 4 THEN DELETE
+                          |WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)
+                          |""".stripMargin)
+      val mergeMetrics = commandMetrics(mergeDf)
+      val mergeExecutionMetrics = commandExecutionMetrics(mergeMetrics)
+      assert(mergeExecutionMetrics(mergeMetrics("updatedRecords").id) == "1")
+      assert(mergeExecutionMetrics(mergeMetrics("deletedRecords").id) == "1")
+      assert(mergeExecutionMetrics(mergeMetrics("insertedRecords").id) == "1")
+    }
+  }
+
+  def metric(metrics: Array[CustomTaskMetric], name: String): Long = {
+    metrics.find(_.name() == name).get.value()
+  }
+
+  def commandMetrics(df: DataFrame): Map[String, SQLMetric] = {
+    df.queryExecution.executedPlan.asInstanceOf[CommandResultExec].commandPhysicalPlan.metrics
+  }
+
+  def commandExecutionMetrics(metrics: Map[String, SQLMetric]): Map[Long, String] = {
+    Utils.waitUntilEventEmpty(spark)
+    val metricIds = metrics.values.map(_.id).toSet
+    val statusStore = spark.sharedState.statusStore
+    statusStore
+      .executionsList()
+      .reverse
+      .find {
+        execution =>
+          val executionMetricIds = execution.metrics.map(_.accumulatorId).toSet
+          metricIds.subsetOf(executionMetricIds)
+      }
+      .map(execution => statusStore.executionMetrics(execution.executionId))
+      .getOrElse {
+        val ids = metricIds.toSeq.sorted.mkString(", ")
+        throw new AssertionError(s"Cannot find execution metrics for command metric ids: $ids")
+      }
+  }
+}

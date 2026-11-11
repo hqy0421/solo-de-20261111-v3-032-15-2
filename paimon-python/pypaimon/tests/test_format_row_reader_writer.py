@@ -1,0 +1,869 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import datetime
+import os
+import struct
+import tempfile
+from decimal import Decimal
+
+import pyarrow as pa
+import pyarrow.compute as pc
+import pytest
+
+from pypaimon.execution.python.read.reader.format_row_reader import (FOOTER_SIZE, FormatRowReader)
+from pypaimon.schema.data_types import (
+    ArrayType, AtomicType, DataField, MapType, RowType
+)
+from pypaimon.execution.python.write.writer.format_row_writer import FormatRowWriter
+
+
+class SimpleFileIO:
+    """Minimal FileIO for testing."""
+
+    def get_file_size(self, path):
+        return os.path.getsize(path)
+
+    def new_input_stream(self, path):
+        return open(path, 'rb')
+
+
+def _write_row_file(path, fields, data_table):
+    with open(path, 'wb') as f:
+        writer = FormatRowWriter(f, fields)
+        writer.write_table(data_table)
+        writer.close()
+
+
+def _read_row_file(path, fields, read_field_names=None, row_indices=None):
+    file_io = SimpleFileIO()
+    if read_field_names is None:
+        read_field_names = [f.name for f in fields]
+    reader = FormatRowReader(file_io, path, read_field_names, fields, None,
+                             row_indices=row_indices)
+    batches = []
+    while True:
+        batch = reader.read_arrow_batch()
+        if batch is None:
+            break
+        batches.append(batch)
+    reader.close()
+    if not batches:
+        return pa.table({f.name: [] for f in fields})
+    return pa.Table.from_batches(batches)
+
+
+class TestFormatRowReaderWriter:
+
+    def test_basic_int_string(self):
+        fields = [
+            DataField(0, "id", AtomicType("INT")),
+            DataField(1, "name", AtomicType("STRING")),
+        ]
+        data = pa.table({
+            "id": pa.array([1, 2, 3], type=pa.int32()),
+            "name": pa.array(["alice", "bob", "charlie"], type=pa.string()),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.column("id").to_pylist() == [1, 2, 3]
+            assert result.column("name").to_pylist() == ["alice", "bob", "charlie"]
+        finally:
+            os.unlink(path)
+
+    def test_high_precision_decimal(self):
+        # DECIMAL(p) with more than 28 significant digits overflows Python's default
+        # decimal context, which silently rounded the value on both write and read.
+        # Cover positive and negative (signed-byte path) high-precision values and a
+        # null, plus the 19..28 band and the compact p<=18 path.
+        fields = [
+            DataField(0, "d_int", AtomicType("DECIMAL(38, 0)")),
+            DataField(1, "d_frac", AtomicType("DECIMAL(38, 10)")),
+            DataField(2, "d_band", AtomicType("DECIMAL(28, 4)")),
+            DataField(3, "d_small", AtomicType("DECIMAL(18, 2)")),
+        ]
+        d_int = [Decimal("12345678901234567890123456789012345678"),
+                 Decimal("-12345678901234567890123456789012345678"), None]
+        d_frac = [Decimal("1234567890123456789012345678.9012345678"),
+                  Decimal("-1234567890123456789012345678.9012345678"), None]
+        d_band = [Decimal("123456789012345678901234.5678"),
+                  Decimal("-123456789012345678901234.5678"), None]
+        d_small = [Decimal("1234.56"), Decimal("-1234.56"), None]
+        data = pa.table({
+            "d_int": pa.array(d_int, type=pa.decimal128(38, 0)),
+            "d_frac": pa.array(d_frac, type=pa.decimal128(38, 10)),
+            "d_band": pa.array(d_band, type=pa.decimal128(28, 4)),
+            "d_small": pa.array(d_small, type=pa.decimal128(18, 2)),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.column("d_int").to_pylist() == d_int
+            assert result.column("d_frac").to_pylist() == d_frac
+            assert result.column("d_band").to_pylist() == d_band
+            assert result.column("d_small").to_pylist() == d_small
+        finally:
+            os.unlink(path)
+
+    def test_high_precision_decimal_decoded_from_wire(self):
+        # Independent of the writer: decode a hand-built signed unscaled byte
+        # sequence (the row-file wire form shared with the Java implementation) and
+        # assert the exact Decimal, so a symmetric writer+reader scaling mistake
+        # cannot round-trip undetected.
+        from pypaimon.execution.python.read.reader.format_row_reader import (_read_field, _RowDecoder)
+
+        def _varint(x):
+            out = bytearray()
+            while True:
+                b = x & 0x7F
+                x >>= 7
+                if x:
+                    out.append(b | 0x80)
+                else:
+                    out.append(b)
+                    return bytes(out)
+
+        unscaled = 12345678901234567890123456789012345678  # 38 significant digits
+        raw = unscaled.to_bytes((unscaled.bit_length() + 8) // 8, 'big', signed=True)
+        buf = _varint(len(raw)) + raw
+        got = _read_field(_RowDecoder(buf, 0), AtomicType("DECIMAL(38, 10)"))
+        assert got == Decimal("1234567890123456789012345678.9012345678")
+
+    def test_timestamp_precisions(self):
+        # from_paimon_type maps the precision to an Arrow unit (0 -> s, 1-3 -> ms,
+        # 4-6 -> us, 7-9 -> ns); the reader must return the value in that unit.
+        # Precision 0 overflowed (millis read as seconds) and 7-9 read low (micros
+        # read as nanos); 1-6 were already correct.
+        fields = [
+            DataField(0, "ts0", AtomicType("TIMESTAMP(0)")),
+            DataField(1, "ts3", AtomicType("TIMESTAMP(3)")),
+            DataField(2, "ts6", AtomicType("TIMESTAMP(6)")),
+            DataField(3, "ts9", AtomicType("TIMESTAMP(9)")),
+        ]
+        base = datetime.datetime(2020, 9, 13, 12, 26, 40)
+        ts0 = base
+        ts3 = base.replace(microsecond=123000)
+        ts6 = base.replace(microsecond=123456)
+        ts9 = base.replace(microsecond=123456)
+        data = pa.table({
+            "ts0": pa.array([ts0], type=pa.timestamp('s')),
+            "ts3": pa.array([ts3], type=pa.timestamp('ms')),
+            "ts6": pa.array([ts6], type=pa.timestamp('us')),
+            "ts9": pa.array([ts9], type=pa.timestamp('ns')),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.column("ts0").to_pylist() == [ts0]
+            assert result.column("ts3").to_pylist() == [ts3]
+            assert result.column("ts6").to_pylist() == [ts6]
+            assert result.column("ts9").to_pylist() == [ts9]
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize("precision,unit", [(0, 's'), (3, 'ms'), (6, 'us')])
+    def test_timestamp_distant_dates(self, tmp_path, precision, unit):
+        # Arrow's integer values provide an expectation independent of datetime
+        # arithmetic in the ROW writer, including dates outside the ns range.
+        micros = [
+            13_569_465_600_000_001,  # 2400-01-01 00:00:00.000001
+            13_569_465_600_123_457,
+            -11_676_095_999_999_999,  # 1600-01-01 00:00:00.000001
+            -1, 0, 1, 1_735_689_600_123_456, None,
+        ]
+        divisor = {'s': 1_000_000, 'ms': 1000, 'us': 1}[unit]
+        expected = [value // divisor if value is not None else None for value in micros]
+        fields = [DataField(0, "ts", AtomicType("TIMESTAMP({})".format(precision)))]
+        data = pa.table({"ts": pa.array(expected, type=pa.timestamp(unit))})
+        path = str(tmp_path / "distant-timestamps.row")
+
+        _write_row_file(path, fields, data)
+        result = _read_row_file(path, fields)
+
+        assert result.column("ts").cast(pa.int64()).to_pylist() == expected
+
+    @pytest.mark.parametrize("type_pattern", ["TIMESTAMP_LTZ({})", "TIMESTAMP({}) WITH LOCAL TIME ZONE"])
+    @pytest.mark.parametrize("precision,unit", [(0, 's'), (3, 'ms'), (6, 'us'), (9, 'ns')])
+    @pytest.mark.parametrize("timezone", ['Asia/Shanghai', 'America/New_York', 'UTC', None])
+    def test_timestamp_ltz_preserves_instant(self, tmp_path, type_pattern, precision, unit, timezone):
+        # Named zones also work with Arrow 6; January and July cover DST changes.
+        micros = [1_735_660_800_123_456, 1_751_328_000_123_456, -1, 0, None]
+        if unit == 'ns':
+            expected = [value * 1000 if value is not None else None for value in micros]
+        else:
+            divisor = {'s': 1_000_000, 'ms': 1000, 'us': 1}[unit]
+            expected = [value // divisor if value is not None else None for value in micros]
+        fields = [DataField(0, "ts", AtomicType(type_pattern.format(precision)))]
+        data = pa.table({"ts": pa.array(expected, type=pa.timestamp(unit, tz=timezone))})
+        path = str(tmp_path / "ltz-timestamps.row")
+
+        _write_row_file(path, fields, data)
+        result = _read_row_file(path, fields)
+
+        assert result.column("ts").type == pa.timestamp(unit, tz='UTC')
+        assert result.column("ts").cast(pa.int64()).to_pylist() == expected
+
+    @pytest.mark.parametrize("offset_hours,zone", [(8, 'Etc/GMT-8'), (-5, 'Etc/GMT+5')])
+    def test_timestamp_without_timezone_preserves_wall_clock(self, tmp_path, offset_hours, zone):
+        timezone = datetime.timezone(datetime.timedelta(hours=offset_hours))
+        values = [
+            datetime.datetime(2025, 1, 1, 0, 0, 0, 123456, tzinfo=timezone),
+            datetime.datetime(1969, 12, 31, 23, 59, 59, 999999, tzinfo=timezone),
+            None,
+        ]
+        fields = [DataField(0, "ts", AtomicType("TIMESTAMP(6)"))]
+        data = pa.table({"ts": pa.array(values, type=pa.timestamp('us', tz=zone))})
+        path = str(tmp_path / "wall-clock-timestamps.row")
+
+        _write_row_file(path, fields, data)
+        result = _read_row_file(path, fields)
+
+        assert result.column("ts").cast(pa.int64()).to_pylist() == [1_735_689_600_123_456, -1, None]
+
+    def test_nested_timestamps(self, tmp_path):
+        timestamp = datetime.datetime(2400, 1, 1, 0, 0, 0, 123457)
+        timezone = datetime.timezone(datetime.timedelta(hours=8))
+        instant = datetime.datetime(2025, 1, 1, 0, 0, 0, 123456, tzinfo=timezone)
+        nested_type = RowType(True, [
+            DataField(1, "local", AtomicType("TIMESTAMP(6)")),
+            DataField(2, "instants", ArrayType(True, AtomicType("TIMESTAMP_LTZ(6)"))),
+        ])
+        fields = [DataField(0, "nested", nested_type)]
+        data = pa.table({"nested": pa.array([
+            {"local": timestamp, "instants": [instant, None]}, None,
+        ], type=pa.struct([
+            pa.field("local", pa.timestamp('us')),
+            pa.field("instants", pa.list_(pa.timestamp('us', tz='Asia/Shanghai'))),
+        ]))})
+        path = str(tmp_path / "nested-timestamps.row")
+
+        _write_row_file(path, fields, data)
+        result = _read_row_file(path, fields)
+
+        assert result.column("nested").to_pylist() == [
+            {"local": timestamp, "instants": [instant.astimezone(datetime.timezone.utc), None]}, None,
+        ]
+
+    def test_timestamp_nanos_decoded_from_wire(self):
+        # A Java-written TIMESTAMP(9) carries nano_of_milli in 0..999999 (genuine
+        # sub-millisecond nanoseconds). The Python writer only emits multiples of
+        # 1000, so decode a hand-built wire buffer to exercise the ns formula with a
+        # non-multiple-of-1000 nano_of_milli directly.
+        from pypaimon.execution.python.read.reader.format_row_reader import (_read_field, _RowDecoder)
+
+        def _varint(n):
+            out = bytearray()
+            while True:
+                b = n & 0x7F
+                n >>= 7
+                if n:
+                    out.append(b | 0x80)
+                else:
+                    out.append(b)
+                    return bytes(out)
+
+        millis = 1600000000000
+        nano_of_milli = 123456
+        buf = struct.pack('<q', millis) + _varint(nano_of_milli)
+        got = _read_field(_RowDecoder(buf, 0), AtomicType("TIMESTAMP(9)"))
+        assert got == millis * 1_000_000 + nano_of_milli
+
+    def test_all_primitive_types(self):
+        fields = [
+            DataField(0, "bool_col", AtomicType("BOOLEAN")),
+            DataField(1, "tinyint_col", AtomicType("TINYINT")),
+            DataField(2, "smallint_col", AtomicType("SMALLINT")),
+            DataField(3, "int_col", AtomicType("INT")),
+            DataField(4, "bigint_col", AtomicType("BIGINT")),
+            DataField(5, "float_col", AtomicType("FLOAT")),
+            DataField(6, "double_col", AtomicType("DOUBLE")),
+            DataField(7, "string_col", AtomicType("STRING")),
+            DataField(8, "binary_col", AtomicType("BYTES")),
+        ]
+        data = pa.table({
+            "bool_col": pa.array([True, False], type=pa.bool_()),
+            "tinyint_col": pa.array([1, -1], type=pa.int8()),
+            "smallint_col": pa.array([100, -100], type=pa.int16()),
+            "int_col": pa.array([1000, -1000], type=pa.int32()),
+            "bigint_col": pa.array([100000, -100000], type=pa.int64()),
+            "float_col": pa.array([1.5, -2.5], type=pa.float32()),
+            "double_col": pa.array([3.14, -2.71], type=pa.float64()),
+            "string_col": pa.array(["hello", "world"], type=pa.string()),
+            "binary_col": pa.array([b"\x01\x02", b"\x03\x04"], type=pa.binary()),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.column("bool_col").to_pylist() == [True, False]
+            assert result.column("tinyint_col").to_pylist() == [1, -1]
+            assert result.column("smallint_col").to_pylist() == [100, -100]
+            assert result.column("int_col").to_pylist() == [1000, -1000]
+            assert result.column("bigint_col").to_pylist() == [100000, -100000]
+            assert result.column("float_col").to_pylist()[0] == pytest.approx(1.5)
+            assert result.column("float_col").to_pylist()[1] == pytest.approx(-2.5)
+            assert result.column("double_col").to_pylist() == [pytest.approx(3.14), pytest.approx(-2.71)]
+            assert result.column("string_col").to_pylist() == ["hello", "world"]
+            assert result.column("binary_col").to_pylist() == [b"\x01\x02", b"\x03\x04"]
+        finally:
+            os.unlink(path)
+
+    def test_nulls(self):
+        fields = [
+            DataField(0, "id", AtomicType("INT")),
+            DataField(1, "name", AtomicType("STRING")),
+        ]
+        data = pa.table({
+            "id": pa.array([1, None, 3], type=pa.int32()),
+            "name": pa.array([None, "bob", None], type=pa.string()),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.column("id").to_pylist() == [1, None, 3]
+            assert result.column("name").to_pylist() == [None, "bob", None]
+        finally:
+            os.unlink(path)
+
+    def test_decimal(self):
+        fields = [
+            DataField(0, "d1", AtomicType("DECIMAL(10, 2)")),
+            DataField(1, "d2", AtomicType("DECIMAL(20, 5)")),
+        ]
+        data = pa.table({
+            "d1": pa.array([Decimal("123.45"), Decimal("-67.89")], type=pa.decimal128(10, 2)),
+            "d2": pa.array([Decimal("12345.67890"), Decimal("-99999.12345")], type=pa.decimal128(20, 5)),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.column("d1").to_pylist() == [Decimal("123.45"), Decimal("-67.89")]
+            assert result.column("d2").to_pylist() == [Decimal("12345.67890"), Decimal("-99999.12345")]
+        finally:
+            os.unlink(path)
+
+    def test_timestamp(self):
+        fields = [
+            DataField(0, "ts_millis", AtomicType("TIMESTAMP(3)")),
+            DataField(1, "ts_micros", AtomicType("TIMESTAMP(6)")),
+        ]
+        data = pa.table({
+            "ts_millis": pa.array([1000, 2000], type=pa.timestamp('ms')),
+            "ts_micros": pa.array([1000000, 2000000], type=pa.timestamp('us')),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.num_rows == 2
+        finally:
+            os.unlink(path)
+
+    def test_array_type(self):
+        element_type = AtomicType("INT")
+        fields = [
+            DataField(0, "arr", ArrayType(True, element_type)),
+        ]
+        data = pa.table({
+            "arr": pa.array([[1, 2, 3], [4, 5]], type=pa.list_(pa.int32())),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.column("arr").to_pylist() == [[1, 2, 3], [4, 5]]
+        finally:
+            os.unlink(path)
+
+    def test_map_type(self):
+        fields = [
+            DataField(0, "m", MapType(True, AtomicType("STRING"), AtomicType("INT"))),
+        ]
+        data = pa.table({
+            "m": pa.array(
+                [[("a", 1), ("b", 2)], [("c", 3)]],
+                type=pa.map_(pa.string(), pa.int32())
+            ),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            result_maps = result.column("m").to_pylist()
+            assert len(result_maps) == 2
+            assert len(result_maps[0]) == 2
+            assert len(result_maps[1]) == 1
+        finally:
+            os.unlink(path)
+
+    def test_nested_row(self):
+        inner_type = RowType(True, [
+            DataField(0, "x", AtomicType("INT")),
+            DataField(1, "y", AtomicType("STRING")),
+        ])
+        fields = [
+            DataField(0, "id", AtomicType("INT")),
+            DataField(1, "nested", inner_type),
+        ]
+        data = pa.table({
+            "id": pa.array([1, 2], type=pa.int32()),
+            "nested": pa.array(
+                [{"x": 10, "y": "a"}, {"x": 20, "y": "b"}],
+                type=pa.struct([
+                    pa.field("x", pa.int32()),
+                    pa.field("y", pa.string()),
+                ])
+            ),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.column("id").to_pylist() == [1, 2]
+            nested = result.column("nested").to_pylist()
+            assert nested[0] == {"x": 10, "y": "a"}
+            assert nested[1] == {"x": 20, "y": "b"}
+        finally:
+            os.unlink(path)
+
+    def test_multi_block(self):
+        fields = [
+            DataField(0, "id", AtomicType("INT")),
+            DataField(1, "data", AtomicType("STRING")),
+        ]
+        num_rows = 5000
+        ids = list(range(num_rows))
+        strings = [f"value_{i}" for i in range(num_rows)]
+        data = pa.table({
+            "id": pa.array(ids, type=pa.int32()),
+            "data": pa.array(strings, type=pa.string()),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            with open(path, 'wb') as f:
+                writer = FormatRowWriter(f, fields, block_size=4096)
+                writer.write_table(data)
+                writer.close()
+
+            result = _read_row_file(path, fields)
+            assert result.num_rows == num_rows
+            assert result.column("id").to_pylist() == ids
+            assert result.column("data").to_pylist() == strings
+        finally:
+            os.unlink(path)
+
+    def test_empty_file(self):
+        fields = [
+            DataField(0, "id", AtomicType("INT")),
+        ]
+        data = pa.table({
+            "id": pa.array([], type=pa.int32()),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.num_rows == 0
+        finally:
+            os.unlink(path)
+
+    def test_column_projection(self):
+        fields = [
+            DataField(0, "id", AtomicType("INT")),
+            DataField(1, "name", AtomicType("STRING")),
+            DataField(2, "value", AtomicType("DOUBLE")),
+        ]
+        data = pa.table({
+            "id": pa.array([1, 2, 3], type=pa.int32()),
+            "name": pa.array(["a", "b", "c"], type=pa.string()),
+            "value": pa.array([1.1, 2.2, 3.3], type=pa.float64()),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields, read_field_names=["id", "value"])
+            assert result.num_columns == 2
+            assert result.column("id").to_pylist() == [1, 2, 3]
+            assert result.column("value").to_pylist() == [pytest.approx(1.1), pytest.approx(2.2), pytest.approx(3.3)]
+        finally:
+            os.unlink(path)
+
+    def test_date_and_time(self):
+        fields = [
+            DataField(0, "d", AtomicType("DATE")),
+            DataField(1, "t", AtomicType("TIME")),
+        ]
+        data = pa.table({
+            "d": pa.array([18000, 19000], type=pa.date32()),
+            "t": pa.array([3600000, 7200000], type=pa.time32('ms')),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            assert result.num_rows == 2
+        finally:
+            os.unlink(path)
+
+    def test_variant_type(self):
+        fields = [
+            DataField(0, "v", AtomicType("VARIANT")),
+        ]
+        data = pa.table({
+            "v": pa.array(
+                [{"value": b"\x01\x02", "metadata": b"\x03\x04"},
+                 {"value": b"\x05", "metadata": b"\x06\x07\x08"}],
+                type=pa.struct([
+                    pa.field("value", pa.binary(), nullable=False),
+                    pa.field("metadata", pa.binary(), nullable=False),
+                ])
+            ),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+            result = _read_row_file(path, fields)
+            variants = result.column("v").to_pylist()
+            assert variants[0]["value"] == b"\x01\x02"
+            assert variants[0]["metadata"] == b"\x03\x04"
+            assert variants[1]["value"] == b"\x05"
+            assert variants[1]["metadata"] == b"\x06\x07\x08"
+        finally:
+            os.unlink(path)
+
+    def test_row_indices_random_access(self):
+        """Test reading specific rows by index (O(1) row-number lookup)."""
+        fields = [
+            DataField(0, "id", AtomicType("INT")),
+            DataField(1, "name", AtomicType("VARCHAR")),
+        ]
+        data = pa.table({
+            "id": pa.array(list(range(100)), type=pa.int32()),
+            "name": pa.array([f"row_{i}" for i in range(100)]),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            _write_row_file(path, fields, data)
+
+            # Read specific rows: 0, 5, 50, 99
+            result = _read_row_file(path, fields, row_indices=[0, 5, 50, 99])
+            assert result.num_rows == 4
+            assert result.column("id").to_pylist() == [0, 5, 50, 99]
+            assert result.column("name").to_pylist() == [
+                "row_0", "row_5", "row_50", "row_99"
+            ]
+
+            # Read single row
+            result = _read_row_file(path, fields, row_indices=[42])
+            assert result.num_rows == 1
+            assert result.column("id").to_pylist() == [42]
+
+            # Read empty indices
+            result = _read_row_file(path, fields, row_indices=[])
+            assert result.num_rows == 0
+        finally:
+            os.unlink(path)
+
+    def test_row_indices_multi_block(self):
+        """Test row_indices across multiple blocks."""
+        fields = [
+            DataField(0, "id", AtomicType("INT")),
+            DataField(1, "value", AtomicType("VARCHAR")),
+        ]
+        # Write enough data to create multiple blocks (small block size)
+        n_rows = 500
+        data = pa.table({
+            "id": pa.array(list(range(n_rows)), type=pa.int32()),
+            "value": pa.array([f"val_{i}" * 10 for i in range(n_rows)]),
+        })
+
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+
+        try:
+            with open(path, 'wb') as f:
+                writer = FormatRowWriter(f, fields, block_size=1024)
+                writer.write_table(data)
+                writer.close()
+
+            # Read rows from different blocks
+            indices = [0, 100, 200, 300, 499]
+            result = _read_row_file(path, fields, row_indices=indices)
+            assert result.num_rows == 5
+            assert result.column("id").to_pylist() == indices
+        finally:
+            os.unlink(path)
+
+    def test_data_evolution_row_id_read(self):
+        """Test Data Evolution scenario: partial-column write then row-id based read.
+
+        Simulates the Data Evolution pattern where:
+        1. First commit writes columns (f0, f1)
+        2. Second commit writes column (f2) with first_row_id=0
+        3. Read merges by row ID to reconstruct full rows
+        """
+        import shutil
+        from pypaimon import CatalogFactory, Schema
+
+        tempdir = tempfile.mkdtemp()
+        try:
+            warehouse = os.path.join(tempdir, 'warehouse')
+            catalog = CatalogFactory.create({'warehouse': warehouse})
+            catalog.create_database('default', True)
+
+            pa_schema = pa.schema([
+                ('f0', pa.int32()),
+                ('f1', pa.string()),
+                ('f2', pa.string()),
+            ])
+
+            schema = Schema.from_pyarrow_schema(
+                pa_schema,
+                options={
+                    'file.format': 'row',
+                    'row-tracking.enabled': 'true',
+                    'data-evolution.enabled': 'true',
+                })
+            catalog.create_table('default.de_row_id_test', schema, False)
+            table = catalog.get_table('default.de_row_id_test')
+
+            # First commit: write (f0, f1)
+            write_builder = table.new_batch_write_builder()
+            table_write = write_builder.new_write().with_write_type(['f0', 'f1'])
+            table_commit = write_builder.new_commit()
+
+            data1 = pa.table({
+                'f0': pa.array([1, 2, 3, 4, 5], type=pa.int32()),
+                'f1': pa.array(['a1', 'a2', 'a3', 'a4', 'a5']),
+            })
+            table_write.write_arrow(data1)
+            table_commit.commit(table_write.prepare_commit())
+            table_write.close()
+            table_commit.close()
+
+            # Second commit: write (f2) with first_row_id = 0
+            table_write = write_builder.new_write().with_write_type(['f2'])
+            table_commit = write_builder.new_commit()
+
+            data2 = pa.table({
+                'f2': pa.array(['b1', 'b2', 'b3', 'b4', 'b5']),
+            })
+            table_write.write_arrow(data2)
+            cmts = table_write.prepare_commit()
+            cmts[0].new_files[0].first_row_id = 0
+            table_commit.commit(cmts)
+            table_write.close()
+            table_commit.close()
+
+            # Read full table - should merge partial columns by row ID
+            table = catalog.get_table('default.de_row_id_test')
+            read_builder = table.new_read_builder()
+            splits = read_builder.new_scan().plan().splits()
+            result = read_builder.new_read().to_arrow(splits)
+
+            assert result.num_rows == 5
+            result_sorted = result.take(pc.sort_indices(result, sort_keys=[('f0', 'ascending')]))
+            assert result_sorted.column('f0').to_pylist() == [1, 2, 3, 4, 5]
+            assert result_sorted.column('f1').to_pylist() == [
+                'a1', 'a2', 'a3', 'a4', 'a5'
+            ]
+            assert result_sorted.column('f2').to_pylist() == [
+                'b1', 'b2', 'b3', 'b4', 'b5'
+            ]
+        finally:
+            shutil.rmtree(tempdir, ignore_errors=True)
+
+
+class TestRowFileIndexConsistency:
+    """The footer and the block index describe the same blocks twice.
+
+    Until they were cross-checked, this reader bounded its block loop by the footer's block_count
+    while the Java reader bounded it by the index array length, so a file the two disagreed about
+    was read differently by each. These pin the agreement the row format spec requires.
+    """
+
+    FIELDS = [DataField(0, "id", AtomicType("INT"))]
+
+    def _write(self, path, rows=1000):
+        data = pa.table({"id": pa.array(list(range(rows)), type=pa.int32())})
+        _write_row_file(path, self.FIELDS, data)
+
+    def _patch(self, path, offset_from_footer, packed):
+        size = os.path.getsize(path)
+        with open(path, 'r+b') as f:
+            f.seek(size - FOOTER_SIZE + offset_from_footer)
+            f.write(packed)
+
+    def test_footer_block_count_must_match_the_index(self):
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+        try:
+            self._write(path)
+            # block_count is a little-endian int at footer offset 8; zero used to make a full scan
+            # return nothing while a row-id read still returned rows
+            self._patch(path, 8, struct.pack('<i', 0))
+            with pytest.raises(IOError, match="the footer declares 0"):
+                _read_row_file(path, self.FIELDS)
+        finally:
+            os.unlink(path)
+
+    def test_index_outside_the_file_is_rejected(self):
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+        try:
+            self._write(path)
+            self._patch(path, 12, struct.pack('<q', 1 << 40))
+            with pytest.raises(IOError, match="Invalid row file block index location"):
+                _read_row_file(path, self.FIELDS)
+        finally:
+            os.unlink(path)
+
+    def test_file_too_short_for_a_footer_is_rejected(self):
+        with tempfile.NamedTemporaryFile(suffix=".row", delete=False) as tmp:
+            path = tmp.name
+        try:
+            with open(path, 'wb') as f:
+                f.write(b'\0' * (FOOTER_SIZE - 1))
+            with pytest.raises(IOError, match="hold no 32-byte footer"):
+                _read_row_file(path, self.FIELDS)
+        finally:
+            os.unlink(path)
+
+    def test_row_starts_must_cover_every_row_exactly_once(self):
+        reader = self._reader_with(compressed=[10, 20], row_starts=[10, 20], total_rows=30)
+        with pytest.raises(IOError, match="block 0 starts at row 10"):
+            reader._validate_block_index()
+
+        reader = self._reader_with(compressed=[10, 20], row_starts=[0, 0], total_rows=30)
+        with pytest.raises(IOError, match="not after block 0 at row 0"):
+            reader._validate_block_index()
+
+        reader = self._reader_with(compressed=[10, 20], row_starts=[0, 5], total_rows=5)
+        with pytest.raises(IOError, match="row count 5 does not reach"):
+            reader._validate_block_index()
+
+        # one block and no declared rows: the block would hold nothing
+        reader = self._reader_with(compressed=[10], row_starts=[0], total_rows=0)
+        with pytest.raises(IOError, match="row count 0 does not reach"):
+            reader._validate_block_index()
+
+    def test_negative_uncompressed_size_is_rejected(self):
+        # the footer bounds the compressed sizes through the sum, but nothing bounds these
+        reader = self._reader_with(compressed=[10, 20], row_starts=[0, 5], total_rows=30)
+        reader._block_uncompressed_sizes = [100, -1]
+        with pytest.raises(IOError, match="block 1 has a negative uncompressed size -1"):
+            reader._validate_block_index()
+
+    def test_compressed_sizes_must_sum_to_the_index_offset(self):
+        # two blocks of 10 and 20 compressed bytes occupy [0, 30), so the index starts at 30
+        reader = self._reader_with(compressed=[10, 20], row_starts=[0, 5], total_rows=30,
+                                   index_offset=30)
+        reader._validate_block_index()
+
+        reader = self._reader_with(compressed=[10, 20], row_starts=[0, 5], total_rows=30,
+                                   index_offset=31)
+        with pytest.raises(IOError, match="blocks end at 30"):
+            reader._validate_block_index()
+
+        # the sum has to be checked for an empty index too, where it is the only thing left
+        reader = self._reader_with(compressed=[], row_starts=[], total_rows=0, index_offset=7)
+        with pytest.raises(IOError, match="blocks end at 0"):
+            reader._validate_block_index()
+
+    def test_negative_compressed_size_is_rejected(self):
+        # the sizes sum to the declared index_offset only because the second cancels the first
+        reader = self._reader_with(compressed=[200, -100], row_starts=[0, 5], total_rows=30,
+                                   index_offset=100)
+        with pytest.raises(IOError, match="block 1 has a negative compressed size -100"):
+            reader._validate_block_index()
+
+    def test_arrays_must_agree_on_the_block_count(self):
+        reader = self._reader_with(compressed=[10, 20], row_starts=[0], total_rows=30)
+        with pytest.raises(IOError, match="2 compressed sizes"):
+            reader._validate_block_index()
+
+    def test_an_empty_index_needs_an_empty_file(self):
+        reader = self._reader_with(compressed=[], row_starts=[], total_rows=0)
+        reader._validate_block_index()
+
+        reader = self._reader_with(compressed=[], row_starts=[], total_rows=7)
+        with pytest.raises(IOError, match="empty, but the footer declares 7 rows"):
+            reader._validate_block_index()
+
+    def _reader_with(self, compressed, row_starts, total_rows, index_offset=None):
+        reader = FormatRowReader.__new__(FormatRowReader)
+        reader._block_compressed_sizes = compressed
+        reader._block_uncompressed_sizes = [100] * len(compressed)
+        reader._block_row_starts = row_starts
+        reader._block_count = len(compressed)
+        reader._total_row_count = total_rows
+        reader._index_offset = sum(compressed) if index_offset is None else index_offset
+        return reader

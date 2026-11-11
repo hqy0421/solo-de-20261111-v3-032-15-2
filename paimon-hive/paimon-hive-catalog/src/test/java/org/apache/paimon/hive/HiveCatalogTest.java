@@ -1,0 +1,1709 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.hive;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.TableType;
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.catalog.CatalogContext;
+import org.apache.paimon.catalog.CatalogTestBase;
+import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.client.ClientPool;
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.options.CatalogOptions;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.partition.Partition;
+import org.apache.paimon.partition.PartitionStatistics;
+import org.apache.paimon.partition.actions.AddDonePartitionAction;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.FallbackReadFileStoreTable;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.object.ObjectTable;
+import org.apache.paimon.table.sink.BatchTableCommit;
+import org.apache.paimon.table.sink.BatchTableWrite;
+import org.apache.paimon.table.sink.BatchWriteBuilder;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.utils.CommonTestUtils;
+import org.apache.paimon.utils.HadoopUtils;
+
+import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableMap;
+import org.apache.paimon.shade.guava30.com.google.common.collect.Lists;
+
+import org.apache.hadoop.hive.conf.HiveConf;
+import org.apache.hadoop.hive.metastore.IMetaStoreClient;
+import org.apache.hadoop.hive.metastore.api.FieldSchema;
+import org.apache.hadoop.hive.metastore.api.Table;
+import org.apache.thrift.TException;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
+
+import static org.apache.hadoop.hive.conf.HiveConf.ConfVars.METASTORECONNECTURLKEY;
+import static org.apache.paimon.CoreOptions.BUCKET;
+import static org.apache.paimon.CoreOptions.CHAIN_TABLE_ENABLED;
+import static org.apache.paimon.CoreOptions.FILE_COMPRESSION;
+import static org.apache.paimon.CoreOptions.FILE_FORMAT;
+import static org.apache.paimon.CoreOptions.MANIFEST_COMPRESSION;
+import static org.apache.paimon.CoreOptions.METASTORE_PARTITIONED_TABLE;
+import static org.apache.paimon.CoreOptions.METASTORE_TAG_TO_PARTITION;
+import static org.apache.paimon.CoreOptions.PARTITION_TIMESTAMP_FORMATTER;
+import static org.apache.paimon.CoreOptions.PARTITION_TIMESTAMP_PATTERN;
+import static org.apache.paimon.CoreOptions.SCAN_FALLBACK_BRANCH;
+import static org.apache.paimon.CoreOptions.SCAN_FALLBACK_DELTA_BRANCH;
+import static org.apache.paimon.CoreOptions.SCAN_FALLBACK_SNAPSHOT_BRANCH;
+import static org.apache.paimon.CoreOptions.SEQUENCE_FIELD;
+import static org.apache.paimon.hive.HiveCatalog.PAIMON_TABLE_IDENTIFIER;
+import static org.apache.paimon.hive.HiveCatalog.TABLE_TYPE_PROP;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
+
+/** Tests for {@link HiveCatalog}. */
+public class HiveCatalogTest extends CatalogTestBase {
+
+    @BeforeEach
+    public void setUp() throws Exception {
+        super.setUp();
+        HiveConf hiveConf = new HiveConf();
+        String jdoConnectionURL = "jdbc:derby:memory:" + UUID.randomUUID();
+        hiveConf.setVar(METASTORECONNECTURLKEY, jdoConnectionURL + ";create=true");
+        String metastoreClientClass = "org.apache.hadoop.hive.metastore.HiveMetaStoreClient";
+        Options catalogOptions = new Options();
+        catalogOptions.set(CatalogOptions.SYNC_ALL_PROPERTIES.key(), "false");
+        CatalogContext context = CatalogContext.create(catalogOptions, hiveConf);
+        catalog = new HiveCatalog(fileIO, hiveConf, metastoreClientClass, context, warehouse);
+    }
+
+    @Test
+    @Override
+    public void testListDatabasesWhenNoDatabases() {
+        // List databases returns an empty list when there are no databases
+        List<String> databases = catalog.listDatabases();
+        assertThat(databases).containsExactly("default");
+    }
+
+    @Test
+    public void testCheckIdentifierUpperCase() throws Exception {
+        catalog.createDatabase("test_db", false);
+        assertThatThrownBy(() -> catalog.createDatabase("TEST_DB", false))
+                .isInstanceOf(Catalog.DatabaseAlreadyExistException.class)
+                .hasMessage("Database TEST_DB already exists.");
+        catalog.createTable(Identifier.create("TEST_DB", "new_table"), DEFAULT_TABLE_SCHEMA, false);
+        assertThatThrownBy(
+                        () ->
+                                catalog.createTable(
+                                        Identifier.create("test_db", "NEW_TABLE"),
+                                        DEFAULT_TABLE_SCHEMA,
+                                        false))
+                .isInstanceOf(Catalog.TableAlreadyExistException.class)
+                .hasMessage("Table test_db.NEW_TABLE already exists.");
+    }
+
+    private static final String HADOOP_CONF_DIR =
+            Thread.currentThread().getContextClassLoader().getResource("hadoop-conf-dir").getPath();
+
+    private static final String HIVE_CONF_DIR =
+            Thread.currentThread().getContextClassLoader().getResource("hive-conf-dir").getPath();
+
+    @Test
+    public void testHadoopConfDir() {
+        HiveConf hiveConf =
+                HiveCatalog.createHiveConf(
+                        null, HADOOP_CONF_DIR, HadoopUtils.getHadoopConfiguration(new Options()));
+        assertThat(hiveConf.get("fs.defaultFS")).isEqualTo("dummy-fs");
+    }
+
+    @Test
+    public void testHiveConfDir() {
+        try {
+            testHiveConfDirImpl();
+        } finally {
+            cleanUpHiveConfDir();
+        }
+    }
+
+    private void testHiveConfDirImpl() {
+        HiveConf hiveConf =
+                HiveCatalog.createHiveConf(
+                        HIVE_CONF_DIR, null, HadoopUtils.getHadoopConfiguration(new Options()));
+        assertThat(hiveConf.get("hive.metastore.uris")).isEqualTo("dummy-hms");
+    }
+
+    private void cleanUpHiveConfDir() {
+        // reset back to default value
+        HiveConf.setHiveSiteLocation(HiveConf.class.getClassLoader().getResource("hive-site.xml"));
+    }
+
+    @Test
+    public void testHadoopConfDirFromEnv() {
+        Map<String, String> newEnv = new HashMap<>(System.getenv());
+        newEnv.put("HADOOP_CONF_DIR", HADOOP_CONF_DIR);
+        // add HADOOP_CONF_DIR to system environment
+        CommonTestUtils.setEnv(newEnv, false);
+
+        HiveConf hiveConf =
+                HiveCatalog.createHiveConf(
+                        null, null, HadoopUtils.getHadoopConfiguration(new Options()));
+        assertThat(hiveConf.get("fs.defaultFS")).isEqualTo("dummy-fs");
+    }
+
+    @Test
+    public void testHiveConfDirFromEnv() {
+        try {
+            testHiveConfDirFromEnvImpl();
+        } finally {
+            cleanUpHiveConfDir();
+        }
+    }
+
+    private void testHiveConfDirFromEnvImpl() {
+        Map<String, String> newEnv = new HashMap<>(System.getenv());
+        newEnv.put("HIVE_CONF_DIR", HIVE_CONF_DIR);
+        // add HIVE_CONF_DIR to system environment
+        CommonTestUtils.setEnv(newEnv, false);
+
+        HiveConf hiveConf =
+                HiveCatalog.createHiveConf(
+                        null, null, HadoopUtils.getHadoopConfiguration(new Options()));
+        assertThat(hiveConf.get("hive.metastore.uris")).isEqualTo("dummy-hms");
+    }
+
+    @Test
+    public void testAddHiveTableParameters() {
+        try {
+            // Create a new database for the test
+            String databaseName = "test_db";
+            catalog.createDatabase(databaseName, false);
+
+            // Create a new table with Hive table parameters
+            String tableName = "new_table";
+            Map<String, String> options = new HashMap<>();
+            options.put("hive.table.owner", "Jon");
+            options.put("hive.storage.format", "ORC");
+            options.put("snapshot.num-retained.min", "5");
+            options.put("snapshot.time-retained", "1h");
+
+            Schema addHiveTableParametersSchema =
+                    new Schema(
+                            Lists.newArrayList(
+                                    new DataField(0, "pk", DataTypes.INT()),
+                                    new DataField(1, "col1", DataTypes.STRING()),
+                                    new DataField(2, "col2", DataTypes.STRING())),
+                            Collections.emptyList(),
+                            Collections.emptyList(),
+                            options,
+                            "this is a hive table");
+
+            catalog.createTable(
+                    Identifier.create(databaseName, tableName),
+                    addHiveTableParametersSchema,
+                    false);
+
+            Field clientField = HiveCatalog.class.getDeclaredField("clients");
+            clientField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            ClientPool<IMetaStoreClient, TException> clients =
+                    (ClientPool<IMetaStoreClient, TException>) clientField.get(catalog);
+            Table table = clients.run(client -> client.getTable(databaseName, tableName));
+            Map<String, String> tableProperties = table.getParameters();
+
+            // Verify the transformed parameters
+            assertThat(tableProperties).containsEntry("table.owner", "Jon");
+            assertThat(tableProperties).containsEntry("storage.format", "ORC");
+            assertThat(tableProperties).containsEntry("comment", "this is a hive table");
+            assertThat(tableProperties)
+                    .containsEntry(
+                            TABLE_TYPE_PROP, PAIMON_TABLE_IDENTIFIER.toUpperCase(Locale.ROOT));
+        } catch (Exception e) {
+            fail("Test failed due to exception: " + e.getMessage());
+        }
+    }
+
+    @Test
+    public void testAlterHiveTableParameters() {
+        try {
+            // Create a new database for the test
+            String databaseName = "test_db";
+            catalog.createDatabase(databaseName, false);
+
+            // Create a new table with Hive table parameters
+            String tableName = "new_table";
+            Map<String, String> options = new HashMap<>();
+            options.put("hive.table.owner", "Jon");
+            options.put("hive.storage.format", "ORC");
+
+            Schema addHiveTableParametersSchema =
+                    new Schema(
+                            Lists.newArrayList(
+                                    new DataField(0, "pk", DataTypes.INT()),
+                                    new DataField(1, "col1", DataTypes.STRING()),
+                                    new DataField(2, "col2", DataTypes.STRING())),
+                            Collections.emptyList(),
+                            Collections.emptyList(),
+                            options,
+                            "");
+
+            catalog.createTable(
+                    Identifier.create(databaseName, tableName),
+                    addHiveTableParametersSchema,
+                    false);
+
+            SchemaChange schemaChange1 = SchemaChange.setOption("hive.table.owner", "Hms");
+            SchemaChange schemaChange2 =
+                    SchemaChange.setOption("hive.table.create_time", "2024-01-22");
+            catalog.alterTable(
+                    Identifier.create(databaseName, tableName),
+                    Arrays.asList(schemaChange1, schemaChange2),
+                    false);
+
+            Field clientField = HiveCatalog.class.getDeclaredField("clients");
+            clientField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            ClientPool<IMetaStoreClient, TException> clients =
+                    (ClientPool<IMetaStoreClient, TException>) clientField.get(catalog);
+            Table table = clients.run(client -> client.getTable(databaseName, tableName));
+            Map<String, String> tableProperties = table.getParameters();
+
+            assertThat(tableProperties).containsEntry("table.owner", "Hms");
+            assertThat(tableProperties).containsEntry("table.create_time", "2024-01-22");
+        } catch (Exception e) {
+            fail("Test failed due to exception: " + e.getMessage());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testAlterAndDropTableWithInvalidOptions(boolean external) throws Exception {
+        String database = "legacy_options_db";
+        Identifier identifier = Identifier.create(database, "legacy_table");
+        catalog.createDatabase(database, false);
+        Path externalPath = new Path(warehouse, "external-data");
+        fileIO.mkdirs(externalPath);
+        fileIO.overwriteFileUtf8(new Path(externalPath, "data"), "data");
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .option("EXTERNAL", Boolean.toString(external))
+                        .option(CoreOptions.DATA_FILE_EXTERNAL_PATHS.key(), externalPath.toString())
+                        .build(),
+                false);
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        SchemaManager schemaManager = table.schemaManager();
+        TableSchema schema = schemaManager.latest().get();
+        Map<String, String> invalidOptions = new HashMap<>(schema.options());
+        invalidOptions.put(CoreOptions.RECORD_LEVEL_TIME_FIELD.key(), "missing");
+        // Simulate options persisted before the corresponding runtime validation was added.
+        fileIO.overwriteFileUtf8(
+                schemaManager.toSchemaPath(schema.id()), schema.copy(invalidOptions).toString());
+
+        assertThatThrownBy(() -> ((FileStoreTable) catalog.getTable(identifier)).newScan())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("missing");
+        catalog.alterTable(
+                identifier,
+                SchemaChange.removeOption(CoreOptions.RECORD_LEVEL_TIME_FIELD.key()),
+                false);
+        assertThat(catalog.getTable(identifier).options())
+                .doesNotContainKey(CoreOptions.RECORD_LEVEL_TIME_FIELD.key());
+        TableSchema repairedSchema = schemaManager.latest().get();
+        assertThat(repairedSchema.id()).isEqualTo(schema.id() + 1);
+
+        fileIO.overwriteFileUtf8(
+                schemaManager.toSchemaPath(repairedSchema.id()),
+                repairedSchema.copy(invalidOptions).toString());
+        assertThatThrownBy(() -> ((FileStoreTable) catalog.getTable(identifier)).newScan())
+                .isInstanceOf(IllegalArgumentException.class);
+        catalog.dropTable(identifier, false);
+
+        assertThat(catalog.listTables(database)).doesNotContain(identifier.getTableName());
+        assertThat(fileIO.exists(table.location())).isEqualTo(external);
+        assertThat(fileIO.exists(externalPath)).isEqualTo(external);
+    }
+
+    @Test
+    public void testDropTableWhenTablePathMissing() throws Exception {
+        String databaseName = "test_db";
+        String tableName = "new_table";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+
+        Schema schema =
+                new Schema(
+                        Lists.newArrayList(
+                                new DataField(0, "pk", DataTypes.INT()),
+                                new DataField(1, "col1", DataTypes.STRING()),
+                                new DataField(2, "col2", DataTypes.STRING())),
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        new HashMap<>(),
+                        "");
+        catalog.createTable(identifier, schema, false);
+
+        HiveCatalog hiveCatalog = (HiveCatalog) catalog;
+        Path path = hiveCatalog.getTableLocation(identifier);
+        hiveCatalog.fileIO().deleteDirectoryQuietly(path);
+
+        assertThatThrownBy(() -> hiveCatalog.getTable(identifier))
+                .isInstanceOf(Catalog.TableNotExistException.class);
+        assertThat(hiveCatalog.listTables(databaseName)).contains(tableName);
+
+        hiveCatalog.dropTable(identifier, false);
+        assertThat(hiveCatalog.listTables(databaseName)).doesNotContain(tableName);
+    }
+
+    @Test
+    public void testListTablesLock() {
+        try {
+            String databaseName = "test_db";
+            catalog.createDatabase(databaseName, false);
+
+            Map<String, String> options = new HashMap<>();
+            Schema addHiveTableParametersSchema =
+                    new Schema(
+                            Lists.newArrayList(
+                                    new DataField(0, "pk", DataTypes.INT()),
+                                    new DataField(1, "col1", DataTypes.STRING()),
+                                    new DataField(2, "col2", DataTypes.STRING())),
+                            Collections.emptyList(),
+                            Collections.emptyList(),
+                            options,
+                            "this is a hive table");
+
+            for (int i = 0; i < 100; i++) {
+                String tableName = "new_table" + i;
+                catalog.createTable(
+                        Identifier.create(databaseName, tableName),
+                        addHiveTableParametersSchema,
+                        false);
+            }
+            List<String> tables1 = new ArrayList<>();
+            List<String> tables2 = new ArrayList<>();
+
+            Thread thread1 =
+                    new Thread(
+                            () -> {
+                                try {
+                                    tables1.addAll(catalog.listTables(databaseName));
+                                } catch (Catalog.DatabaseNotExistException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            });
+            Thread thread2 =
+                    new Thread(
+                            () -> {
+                                try {
+                                    tables2.addAll(catalog.listTables(databaseName));
+                                } catch (Catalog.DatabaseNotExistException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            });
+
+            thread1.start();
+            thread2.start();
+
+            long timeout = 5000;
+            long startTime = System.currentTimeMillis();
+
+            AtomicBoolean deadlockDetected = new AtomicBoolean(false);
+            while (thread1.isAlive() || thread2.isAlive()) {
+                if (System.currentTimeMillis() - startTime > timeout) {
+                    deadlockDetected.set(true);
+                    thread1.interrupt();
+                    thread2.interrupt();
+                    break;
+                }
+
+                Thread.sleep(100);
+            }
+
+            assertThat(deadlockDetected).isFalse();
+            assertThat(tables1).size().isEqualTo(100);
+            assertThat(tables1).containsAll(tables2);
+            assertThat(tables2).containsAll(tables1);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Test
+    public void testListTables() throws Exception {
+        String databaseName = "testListTables";
+        catalog.dropDatabase(databaseName, true, true);
+        catalog.createDatabase(databaseName, true);
+        for (int i = 0; i < 500; i++) {
+            catalog.createTable(
+                    Identifier.create(databaseName, "table" + i),
+                    Schema.newBuilder().column("col", DataTypes.INT()).build(),
+                    true);
+        }
+
+        // use default 300
+        List<String> defaultBatchTables = catalog.listTables(databaseName);
+
+        // use custom 400
+        HiveConf hiveConf = new HiveConf();
+        hiveConf.set(HiveConf.ConfVars.METASTORE_BATCH_RETRIEVE_MAX.varname, "400");
+        String metastoreClientClass = "org.apache.hadoop.hive.metastore.HiveMetaStoreClient";
+        List<String> customBatchTables;
+        try (HiveCatalog customCatalog =
+                new HiveCatalog(fileIO, hiveConf, metastoreClientClass, warehouse)) {
+            customBatchTables = customCatalog.listTables(databaseName);
+        }
+        assertEquals(defaultBatchTables.size(), customBatchTables.size());
+        defaultBatchTables.sort(String::compareTo);
+        customBatchTables.sort(String::compareTo);
+        for (int i = 0; i < defaultBatchTables.size(); i++) {
+            assertEquals(defaultBatchTables.get(i), customBatchTables.get(i));
+        }
+
+        // use invalid batch size
+        HiveConf invalidHiveConf = new HiveConf();
+        invalidHiveConf.set(HiveConf.ConfVars.METASTORE_BATCH_RETRIEVE_MAX.varname, "dummy");
+        List<String> invalidBatchSizeTables;
+        try (HiveCatalog invalidBatchSizeCatalog =
+                new HiveCatalog(fileIO, invalidHiveConf, metastoreClientClass, warehouse)) {
+            invalidBatchSizeTables = invalidBatchSizeCatalog.listTables(databaseName);
+        }
+        assertEquals(defaultBatchTables.size(), invalidBatchSizeTables.size());
+        invalidBatchSizeTables.sort(String::compareTo);
+        for (int i = 0; i < defaultBatchTables.size(); i++) {
+            assertEquals(defaultBatchTables.get(i), invalidBatchSizeTables.get(i));
+        }
+
+        catalog.dropDatabase(databaseName, true, true);
+    }
+
+    @Override
+    protected boolean supportsView() {
+        return true;
+    }
+
+    @Override
+    protected boolean supportPartitions() {
+        return true;
+    }
+
+    @Override
+    protected boolean supportsFormatTable() {
+        return true;
+    }
+
+    @Override
+    protected void checkPartition(Partition expected, Partition actual) {
+        assertThat(actual.recordCount()).isEqualTo(expected.recordCount());
+        assertThat(actual.lastFileCreationTime()).isEqualTo(expected.lastFileCreationTime() / 1000);
+    }
+
+    @Test
+    public void testObjectTable() throws Exception {
+        String databaseName = "object_table_db";
+        String tableName = "object_table";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+
+        // Create object table with only options (type=object-table)
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.TYPE.key(), TableType.OBJECT_TABLE.toString());
+        Schema schema = Schema.newBuilder().options(options).build();
+
+        catalog.createTable(identifier, schema, false);
+
+        // Verify table exists in HMS
+        assertThat(catalog.listTables(databaseName)).contains(tableName);
+
+        // Verify getTable returns ObjectTable instance
+        org.apache.paimon.table.Table table = catalog.getTable(identifier);
+        assertThat(table).isInstanceOf(ObjectTable.class);
+
+        ObjectTable objectTable = (ObjectTable) table;
+        // Verify fixed schema fields
+        assertThat(objectTable.rowType().getFieldNames())
+                .containsExactly("path", "name", "length", "mtime", "atime", "owner");
+        // Verify location is set (defaults to table path)
+        assertThat(objectTable.location()).isNotNull();
+        // Verify options contain type=object-table
+        assertThat(objectTable.options().get(CoreOptions.TYPE.key()))
+                .isEqualTo(TableType.OBJECT_TABLE.toString());
+
+        // Drop table and verify it's gone
+        catalog.dropTable(identifier, false);
+        assertThat(catalog.listTables(databaseName)).doesNotContain(tableName);
+    }
+
+    @Test
+    public void testObjectTableWithCustomPath() throws Exception {
+        String databaseName = "object_table_custom_db";
+        String tableName = "object_table_custom";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+
+        // Create object table with custom path
+        String customPath =
+                new Path(warehouse, databaseName + ".db/" + tableName + "_data").toString();
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.TYPE.key(), TableType.OBJECT_TABLE.toString());
+        options.put(CoreOptions.PATH.key(), customPath);
+        Schema schema = Schema.newBuilder().options(options).build();
+
+        catalog.createTable(identifier, schema, false);
+
+        // Verify getTable returns ObjectTable with the custom location
+        org.apache.paimon.table.Table table = catalog.getTable(identifier);
+        assertThat(table).isInstanceOf(ObjectTable.class);
+        ObjectTable objectTable = (ObjectTable) table;
+        assertThat(objectTable.location()).isEqualTo(customPath);
+
+        // Clean up
+        catalog.dropTable(identifier, false);
+    }
+
+    @Test
+    public void testCreateExternalTableWithLocation(@TempDir java.nio.file.Path tempDir)
+            throws Exception {
+        HiveConf hiveConf = new HiveConf();
+        String jdoConnectionURL = "jdbc:derby:memory:" + UUID.randomUUID();
+        hiveConf.setVar(METASTORECONNECTURLKEY, jdoConnectionURL + ";create=true");
+        hiveConf.set(CatalogOptions.TABLE_TYPE.key(), "external");
+        String metastoreClientClass = "org.apache.hadoop.hive.metastore.HiveMetaStoreClient";
+        HiveCatalog externalWarehouseCatalog =
+                new HiveCatalog(fileIO, hiveConf, metastoreClientClass, warehouse);
+
+        String externalTablePath = tempDir.toString();
+
+        Schema schema =
+                new Schema(
+                        Lists.newArrayList(new DataField(0, "foo", DataTypes.INT())),
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        ImmutableMap.of("path", externalTablePath),
+                        "");
+
+        Identifier identifier = Identifier.create("default", "my_table");
+        externalWarehouseCatalog.createTable(identifier, schema, true);
+
+        org.apache.paimon.table.Table table = externalWarehouseCatalog.getTable(identifier);
+        assertThat(table.options())
+                .extracting(CoreOptions.PATH.key())
+                .isEqualTo("file:" + externalTablePath);
+
+        externalWarehouseCatalog.close();
+    }
+
+    @Test
+    public void testTagToPartitionTable() throws Exception {
+        String databaseName = "testTagToPartitionTable";
+        catalog.dropDatabase(databaseName, true, true);
+        catalog.createDatabase(databaseName, true);
+        Identifier identifier = Identifier.create(databaseName, "table");
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_TAG_TO_PARTITION.key(), "dt")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .build(),
+                true);
+
+        catalog.createPartitions(
+                identifier,
+                Arrays.asList(
+                        Collections.singletonMap("dt", "20250101"),
+                        Collections.singletonMap("dt", "20250102")));
+        assertThat(catalog.listPartitions(identifier).stream().map(Partition::spec))
+                .containsExactlyInAnyOrder(
+                        Collections.singletonMap("dt", "20250102"),
+                        Collections.singletonMap("dt", "20250101"));
+    }
+
+    @Test
+    public void testDropPartitionsOnChainTableDoesNotSkipHmsByFallback() throws Exception {
+        String databaseName = "test_chain_drop_partition";
+        String tableName = "chain_table";
+        catalog.dropDatabase(databaseName, true, true);
+        catalog.createDatabase(databaseName, true);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(BUCKET.key(), "1")
+                        .option(SEQUENCE_FIELD.key(), "v")
+                        .option(FILE_FORMAT.key(), "avro")
+                        .option(FILE_COMPRESSION.key(), "snappy")
+                        .option(MANIFEST_COMPRESSION.key(), "snappy")
+                        .column("dt", DataTypes.STRING())
+                        .column("pk", DataTypes.STRING())
+                        .column("v", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .primaryKey("pk", "dt")
+                        .build(),
+                false);
+
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        table.createBranch("snapshot");
+        table.createBranch("delta");
+
+        List<SchemaChange> chainOptions =
+                Arrays.asList(
+                        SchemaChange.setOption(CHAIN_TABLE_ENABLED.key(), "true"),
+                        SchemaChange.setOption(SCAN_FALLBACK_SNAPSHOT_BRANCH.key(), "snapshot"),
+                        SchemaChange.setOption(SCAN_FALLBACK_DELTA_BRANCH.key(), "delta"),
+                        SchemaChange.setOption(PARTITION_TIMESTAMP_PATTERN.key(), "$dt"),
+                        SchemaChange.setOption(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd"));
+        catalog.alterTable(identifier, chainOptions, false);
+        catalog.alterTable(
+                new Identifier(databaseName, tableName, "snapshot"), chainOptions, false);
+        catalog.alterTable(new Identifier(databaseName, tableName, "delta"), chainOptions, false);
+
+        Identifier snapshotId = new Identifier(databaseName, tableName, "snapshot");
+        Identifier deltaId = new Identifier(databaseName, tableName, "delta");
+        writePartitionRow(snapshotId, "20250101", "1");
+        writePartitionRow(snapshotId, "20250102", "1");
+        writePartitionRow(deltaId, "20250102", "1");
+        writePartitionRow(identifier, "20250103", "1");
+
+        assertHmsDts(databaseName, tableName, "20250101", "20250102", "20250103");
+        assertPhysicalDts(snapshotId, "20250101", "20250102");
+        assertPhysicalDts(deltaId, "20250102");
+        assertPhysicalDts(identifier, "20250103");
+
+        // Dropping from snapshot must not keep HMS just because main falls back to snapshot.
+        catalog.dropPartitions(snapshotId, partitionSpecs("20250101"));
+        assertHmsDts(databaseName, tableName, "20250102", "20250103");
+        assertPhysicalDts(snapshotId, "20250102");
+
+        // Delta still has 20250102, so HMS must be kept.
+        catalog.dropPartitions(snapshotId, partitionSpecs("20250102"));
+        assertHmsDts(databaseName, tableName, "20250102", "20250103");
+        assertPhysicalDts(snapshotId);
+        assertPhysicalDts(deltaId, "20250102");
+
+        catalog.dropPartitions(deltaId, partitionSpecs("20250102"));
+        assertHmsDts(databaseName, tableName, "20250103");
+        assertPhysicalDts(deltaId);
+
+        // Snapshot still has no 20250103; dropping from main can drop HMS.
+        catalog.dropPartitions(identifier, partitionSpecs("20250103"));
+        assertHmsDts(databaseName, tableName);
+        assertPhysicalDts(identifier);
+
+        // Partition that still exists on snapshot must not be dropped from HMS via main.
+        writePartitionRow(snapshotId, "20250104", "1");
+        assertHmsDts(databaseName, tableName, "20250104");
+        catalog.dropPartitions(identifier, partitionSpecs("20250104"));
+        assertHmsDts(databaseName, tableName, "20250104");
+        assertPhysicalDts(snapshotId, "20250104");
+        assertPhysicalDts(identifier);
+    }
+
+    @Test
+    public void testDropPartitionsOnFallbackBranchTableDoesNotSkipHmsByFallback() throws Exception {
+        String databaseName = "test_fallback_drop_partition";
+        String tableName = "fallback_table";
+        catalog.dropDatabase(databaseName, true, true);
+        catalog.createDatabase(databaseName, true);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(FILE_FORMAT.key(), "avro")
+                        .option(FILE_COMPRESSION.key(), "snappy")
+                        .option(MANIFEST_COMPRESSION.key(), "snappy")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        table.createBranch("fallback");
+        catalog.alterTable(
+                identifier,
+                Collections.singletonList(
+                        SchemaChange.setOption(SCAN_FALLBACK_BRANCH.key(), "fallback")),
+                false);
+
+        Identifier fallbackId = new Identifier(databaseName, tableName, "fallback");
+        writeAppendPartition(fallbackId, "20250101");
+        writeAppendPartition(identifier, "20250102");
+
+        assertHmsDts(databaseName, tableName, "20250101", "20250102");
+        assertPhysicalDts(fallbackId, "20250101");
+        assertPhysicalDts(identifier, "20250102");
+
+        catalog.dropPartitions(identifier, partitionSpecs("20250101"));
+        assertHmsDts(databaseName, tableName, "20250101", "20250102");
+        assertPhysicalDts(fallbackId, "20250101");
+
+        catalog.dropPartitions(fallbackId, partitionSpecs("20250101"));
+        assertHmsDts(databaseName, tableName, "20250102");
+        assertPhysicalDts(fallbackId);
+
+        catalog.dropPartitions(identifier, partitionSpecs("20250102"));
+        assertHmsDts(databaseName, tableName);
+        assertPhysicalDts(identifier);
+    }
+
+    @Test
+    public void testCreateAndDropPartitionsWithSpecNotInPartitionKeyOrder() throws Exception {
+        String databaseName = "test_partition_spec_order";
+        String tableName = "multi_key_table";
+        catalog.dropDatabase(databaseName, true, true);
+        catalog.createDatabase(databaseName, true);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .column("hh", DataTypes.STRING())
+                        .partitionKeys("dt", "hh")
+                        .build(),
+                false);
+        IMetaStoreClient hmsClient = ((HiveCatalog) catalog).getHmsClient();
+
+        // register dt=d1/hh=h1 and its mirror dt=h1/hh=d1 in partition key order
+        catalog.createPartitions(
+                identifier,
+                Arrays.asList(
+                        orderedSpec("dt", "d1", "hh", "h1"), orderedSpec("dt", "h1", "hh", "d1")));
+        assertThat(hmsClient.listPartitions(databaseName, tableName, Short.MAX_VALUE))
+                .extracting(p -> p.getValues())
+                .containsExactlyInAnyOrder(Arrays.asList("d1", "h1"), Arrays.asList("h1", "d1"));
+
+        // drop dt=d1/hh=h1 with a spec in reversed key order, the mirror must be kept
+        catalog.dropPartitions(
+                identifier, Collections.singletonList(orderedSpec("hh", "h1", "dt", "d1")));
+        assertThat(hmsClient.listPartitions(databaseName, tableName, Short.MAX_VALUE))
+                .extracting(p -> p.getValues())
+                .containsExactly(Arrays.asList("h1", "d1"));
+
+        // create dt=d9/hh=h9 with a spec in reversed key order
+        catalog.createPartitions(
+                identifier, Collections.singletonList(orderedSpec("hh", "h9", "dt", "d9")));
+        assertThat(hmsClient.listPartitions(databaseName, tableName, Short.MAX_VALUE))
+                .extracting(p -> p.getValues())
+                .containsExactlyInAnyOrder(Arrays.asList("h1", "d1"), Arrays.asList("d9", "h9"));
+        assertThat(
+                        hmsClient
+                                .getPartition(databaseName, tableName, Arrays.asList("d9", "h9"))
+                                .getSd()
+                                .getLocation())
+                .endsWith("/dt=d9/hh=h9");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testExpireIntegerPartitionsWithDoneMarkers(boolean markDone) throws Exception {
+        String databaseName = "test_expire_integer_partitions";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd")
+                        .option(PARTITION_TIMESTAMP_PATTERN.key(), "$dt")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.INT())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            write.write(GenericRow.of(1, 20230101));
+            write.write(GenericRow.of(2, 20990101));
+            commit.commit(write.prepareCommit());
+        }
+        if (markDone) {
+            AddDonePartitionAction action =
+                    new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+            action.markDone("dt=20230101");
+            action.markDone("dt=20990101");
+        }
+        Map<String, String> expirationOptions = new HashMap<>();
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_TIME.key(), "1 d");
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "0 s");
+        table = table.copy(expirationOptions);
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+        table.store().newPartitionExpire("expire", table).expire(Long.MAX_VALUE);
+
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(snapshotId + 1);
+        assertThat(table.newScan().listPartitions())
+                .extracting(partition -> partition.getInt(0))
+                .containsExactly(20990101);
+        if (markDone) {
+            assertHmsDts(databaseName, tableName, "20990101", "20990101.done");
+        } else {
+            assertHmsDts(databaseName, tableName, "20990101");
+        }
+    }
+
+    @Test
+    public void testDropPartitionsCleansDoneMarkersInPartitionKeyOrder() throws Exception {
+        String databaseName = "test_drop_multi_key_done_markers";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .column("hh", DataTypes.INT())
+                        .partitionKeys("dt", "hh")
+                        .build(),
+                false);
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            write.write(GenericRow.of(1, BinaryString.fromString("20230101"), 1));
+            write.write(GenericRow.of(2, BinaryString.fromString("20230101.done"), 1));
+            commit.commit(write.prepareCommit());
+        }
+        table.createBranch("empty");
+        AddDonePartitionAction action =
+                new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+        action.markDone("dt=20230101/hh=1");
+        action.markDone("dt=20230101.done/hh=1");
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+
+        catalog.dropPartitions(
+                identifier, Collections.singletonList(orderedSpec("hh", "1", "dt", "20230101")));
+
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(snapshotId + 1);
+        assertThat(table.newScan().listPartitions())
+                .extracting(partition -> partition.getString(0).toString())
+                .containsExactly("20230101.done");
+        assertThat(((HiveCatalog) catalog).listPartitionsFromHms(identifier))
+                .extracting(partition -> partition.getValues())
+                .containsExactlyInAnyOrder(
+                        Arrays.asList("20230101.done", "1"),
+                        Arrays.asList("20230101.done", "1.done"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testExpireIntegerPartitionsWithEmptyBranch(boolean markDone) throws Exception {
+        String databaseName = "test_expire_integer_partitions";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd")
+                        .option(PARTITION_TIMESTAMP_PATTERN.key(), "$dt")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.INT())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            write.write(GenericRow.of(1, 20230101));
+            write.write(GenericRow.of(2, 20990101));
+            commit.commit(write.prepareCommit());
+        }
+        if (markDone) {
+            AddDonePartitionAction action =
+                    new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+            action.markDone("dt=20230101");
+            action.markDone("dt=20990101");
+        }
+        Map<String, String> expirationOptions = new HashMap<>();
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_TIME.key(), "1 d");
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "0 s");
+        table.createBranch("empty");
+        assertThat(table.switchToBranch("empty").newScan().listPartitions()).isEmpty();
+        table = table.copy(expirationOptions);
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+        table.store().newPartitionExpire("expire", table).expire(Long.MAX_VALUE);
+
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(snapshotId + 1);
+        assertThat(table.newScan().listPartitions())
+                .extracting(partition -> partition.getInt(0))
+                .containsExactly(20990101);
+        if (markDone) {
+            assertHmsDts(databaseName, tableName, "20990101", "20990101.done");
+        } else {
+            assertHmsDts(databaseName, tableName, "20990101");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testExpireIntegerPartitionsSharedWithOtherBranch(boolean markDone)
+            throws Exception {
+        String databaseName = "test_expire_shared_integer_partitions";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd")
+                        .option(PARTITION_TIMESTAMP_PATTERN.key(), "$dt")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.INT())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            write.write(GenericRow.of(1, 20230101));
+            write.write(GenericRow.of(2, 20230102));
+            write.write(GenericRow.of(3, 20990101));
+            commit.commit(write.prepareCommit());
+        }
+        table.createBranch("other");
+        FileStoreTable other = table.switchToBranch("other");
+        BatchWriteBuilder otherWriteBuilder = other.newBatchWriteBuilder();
+        try (BatchTableWrite write = otherWriteBuilder.newWrite();
+                BatchTableCommit commit = otherWriteBuilder.newCommit()) {
+            write.write(GenericRow.of(2, 20230102));
+            commit.commit(write.prepareCommit());
+        }
+        if (markDone) {
+            AddDonePartitionAction action =
+                    new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+            action.markDone("dt=20230101");
+            action.markDone("dt=20230102");
+            action.markDone("dt=20990101");
+        }
+        Map<String, String> expirationOptions = new HashMap<>();
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_TIME.key(), "1 d");
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "0 s");
+        table = table.copy(expirationOptions);
+        table.store().newPartitionExpire("expire-main", table).expire(Long.MAX_VALUE);
+
+        assertThat(table.newScan().listPartitions())
+                .extracting(partition -> partition.getInt(0))
+                .containsExactly(20990101);
+        assertThat(other.newScan().listPartitions())
+                .extracting(partition -> partition.getInt(0))
+                .containsExactly(20230102);
+        if (markDone) {
+            assertHmsDts(
+                    databaseName,
+                    tableName,
+                    "20230102",
+                    "20230102.done",
+                    "20990101",
+                    "20990101.done");
+        } else {
+            assertHmsDts(databaseName, tableName, "20230102", "20990101");
+        }
+
+        // Only the last branch holding a partition may remove its shared HMS entry and marker.
+        other = other.copy(expirationOptions);
+        other.store().newPartitionExpire("expire-other", other).expire(Long.MAX_VALUE);
+        assertThat(other.newScan().listPartitions()).isEmpty();
+        assertThat(table.newScan().listPartitions())
+                .extracting(partition -> partition.getInt(0))
+                .containsExactly(20990101);
+        if (markDone) {
+            assertHmsDts(databaseName, tableName, "20990101", "20990101.done");
+        } else {
+            assertHmsDts(databaseName, tableName, "20990101");
+        }
+    }
+
+    @Test
+    public void testDropRealDoneSuffixPartitionAndItsMarker() throws Exception {
+        String databaseName = "test_drop_partition_metadata";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+        writeAppendPartition(identifier, "20230101.done");
+        writeAppendPartition(identifier, "20990101");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        AddDonePartitionAction action =
+                new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+        action.markDone("dt=20230101.done");
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+
+        // A real STRING partition ending in .done must still support ordinary data deletion.
+        catalog.dropPartitions(identifier, partitionSpecs("20230101.done"));
+
+        assertHmsDts(databaseName, tableName, "20990101");
+        assertPhysicalDts(identifier, "20990101");
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(snapshotId + 1);
+    }
+
+    @Test
+    public void testRealDoneSuffixPartitionKeepsBranchProtection() throws Exception {
+        String databaseName = "test_real_done_suffix_partition";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+        writeAppendPartition(identifier, "20230101.done");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        table.createBranch("other");
+        Identifier otherId = new Identifier(databaseName, tableName, "other");
+        writeAppendPartition(otherId, "20230101.done");
+        AddDonePartitionAction action =
+                new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+        action.markDone("dt=20230101.done");
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+
+        catalog.dropPartitions(identifier, partitionSpecs("20230101.done"));
+        assertPhysicalDts(identifier);
+        assertPhysicalDts(otherId, "20230101.done");
+        assertHmsDts(databaseName, tableName, "20230101.done", "20230101.done.done");
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(snapshotId + 1);
+
+        catalog.dropPartitions(otherId, partitionSpecs("20230101.done"));
+        assertPhysicalDts(otherId);
+        assertHmsDts(databaseName, tableName);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testTtlKeepsOtherBranchRealDoneSuffixPartition(boolean markDone) throws Exception {
+        String databaseName = "test_ttl_done_name_collision";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd")
+                        .option(PARTITION_TIMESTAMP_PATTERN.key(), "$dt")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+        writeAppendPartition(identifier, "20230101");
+        writeAppendPartition(identifier, "20990101");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        table.createBranch("other");
+        Identifier otherId = new Identifier(databaseName, tableName, "other");
+        writeAppendPartition(otherId, "20230101.done");
+        FileStoreTable other = (FileStoreTable) catalog.getTable(otherId);
+        long otherSnapshot = other.snapshotManager().latestSnapshotId();
+        if (markDone) {
+            AddDonePartitionAction action =
+                    new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+            action.markDone("dt=20230101");
+        }
+        Map<String, String> expirationOptions = new HashMap<>();
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_TIME.key(), "1 d");
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "0 s");
+        table = table.copy(expirationOptions);
+        table.store().newPartitionExpire("expire-main", table).expire(Long.MAX_VALUE);
+
+        assertPhysicalDts(identifier, "20990101");
+        assertPhysicalDts(otherId, "20230101.done");
+        assertThat(other.snapshotManager().latestSnapshotId()).isEqualTo(otherSnapshot);
+        assertHmsDts(databaseName, tableName, "20990101", "20230101.done");
+    }
+
+    @ParameterizedTest
+    @CsvSource({"0,false", "0,true", "1,false", "1,true"})
+    public void testExpireIntegerChainPartitionsWithDoneMarkers(int batchSize, boolean markDone)
+            throws Exception {
+        String databaseName = "test_integer_chain_done_expire";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(BUCKET.key(), "1")
+                        .option(SEQUENCE_FIELD.key(), "v")
+                        .option(FILE_FORMAT.key(), "avro")
+                        .option(FILE_COMPRESSION.key(), "snappy")
+                        .option(MANIFEST_COMPRESSION.key(), "snappy")
+                        .column("dt", DataTypes.INT())
+                        .column("pk", DataTypes.STRING())
+                        .column("v", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .primaryKey("pk", "dt")
+                        .build(),
+                false);
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        table.createBranch("snapshot");
+        table.createBranch("delta");
+        Identifier snapshotId = new Identifier(databaseName, tableName, "snapshot");
+        Identifier deltaId = new Identifier(databaseName, tableName, "delta");
+        List<SchemaChange> chainOptions =
+                Arrays.asList(
+                        SchemaChange.setOption(CHAIN_TABLE_ENABLED.key(), "true"),
+                        SchemaChange.setOption(SCAN_FALLBACK_SNAPSHOT_BRANCH.key(), "snapshot"),
+                        SchemaChange.setOption(SCAN_FALLBACK_DELTA_BRANCH.key(), "delta"),
+                        SchemaChange.setOption(PARTITION_TIMESTAMP_PATTERN.key(), "$dt"),
+                        SchemaChange.setOption(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd"));
+        for (Identifier branchId : Arrays.asList(identifier, snapshotId, deltaId)) {
+            catalog.alterTable(branchId, chainOptions, false);
+        }
+        writeIntegerChainPartitions(snapshotId, 20230101, 20230201, 20230301);
+        writeIntegerChainPartitions(deltaId, 20230110, 20230210, 20230310);
+        if (markDone) {
+            AddDonePartitionAction action =
+                    new AddDonePartitionAction(
+                            ((FileStoreTable) catalog.getTable(identifier))
+                                    .catalogEnvironment()
+                                    .partitionModification());
+            for (int dt : new int[] {20230101, 20230201, 20230301, 20230110, 20230210, 20230310}) {
+                action.markDone("dt=" + dt);
+            }
+        }
+        table = (FileStoreTable) catalog.getTable(identifier);
+        Map<String, String> expirationOptions = new HashMap<>();
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_TIME.key(), "1 d");
+        expirationOptions.put(CoreOptions.PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "0 s");
+        if (batchSize > 0) {
+            expirationOptions.put(
+                    CoreOptions.PARTITION_EXPIRATION_BATCH_SIZE.key(), String.valueOf(batchSize));
+        }
+        table = table.copy(expirationOptions);
+        table.store().newPartitionExpire("expire-chain", table).expire(Long.MAX_VALUE);
+
+        assertThat(
+                        ((FileStoreTable) catalog.getTable(snapshotId))
+                                .newSnapshotReader()
+                                .partitionEntries())
+                .extracting(entry -> entry.partition().getInt(0))
+                .containsExactly(20230301);
+        assertThat(
+                        ((FileStoreTable) catalog.getTable(deltaId))
+                                .newSnapshotReader()
+                                .partitionEntries())
+                .extracting(entry -> entry.partition().getInt(0))
+                .containsExactly(20230310);
+        if (markDone) {
+            assertHmsDts(
+                    databaseName,
+                    tableName,
+                    "20230301",
+                    "20230301.done",
+                    "20230310",
+                    "20230310.done");
+        } else {
+            assertHmsDts(databaseName, tableName, "20230301", "20230310");
+        }
+    }
+
+    @Test
+    public void testMarkerCleanupKeepsCurrentBranchRealDoneSuffixPartition() throws Exception {
+        String databaseName = "test_current_branch_done_collision";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+        writeAppendPartition(identifier, "20230101");
+        writeAppendPartition(identifier, "20230101.done");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+
+        catalog.dropPartitions(identifier, partitionSpecs("20230101"));
+
+        assertHmsDts(databaseName, tableName, "20230101.done");
+        assertPhysicalDts(identifier, "20230101.done");
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(snapshotId + 1);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "scan.snapshot-id,false",
+        "scan.snapshot-id,true",
+        "scan.tag-name,false",
+        "scan.tag-name,true"
+    })
+    public void testMarkerCleanupIgnoresHistoricalReads(String selector, boolean otherBranch)
+            throws Exception {
+        String databaseName = "test_marker_cleanup_historical_reads";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+        writeAppendPartition(identifier, "keep");
+        writeAppendPartition(identifier, "20230101");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        Identifier owner = identifier;
+        if (otherBranch) {
+            table.createBranch("other");
+            owner = new Identifier(databaseName, tableName, "other");
+            writeAppendPartition(owner, "keep");
+        }
+        writeAppendPartition(owner, "20230101.done");
+        setHistoricalReadSelector(owner, selector);
+        assertPhysicalDts(owner, "keep");
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+
+        catalog.dropPartitions(identifier, partitionSpecs("20230101"));
+
+        // Ownership checks must neither follow nor remove the persisted query selector.
+        assertPhysicalDts(owner, "keep");
+        catalog.alterTable(
+                owner, Collections.singletonList(SchemaChange.removeOption(selector)), false);
+        assertPhysicalDts(owner, "keep", "20230101.done");
+        if (otherBranch) {
+            assertPhysicalDts(identifier, "keep");
+        }
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(snapshotId + 1);
+        assertHmsDts(databaseName, tableName, "keep", "20230101.done");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"scan.snapshot-id", "scan.tag-name"})
+    public void testDropPartitionsKeepsSharedPartitionWithHistoricalReads(String selector)
+            throws Exception {
+        String databaseName = "test_shared_partition_historical_reads";
+        String tableName = "t";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+        writeAppendPartition(identifier, "keep");
+        writeAppendPartition(identifier, "20230101");
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        table.createBranch("other");
+        Identifier other = new Identifier(databaseName, tableName, "other");
+        writeAppendPartition(other, "keep");
+        writeAppendPartition(other, "20230101");
+        AddDonePartitionAction action =
+                new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+        action.markDone("dt=20230101");
+        setHistoricalReadSelector(other, selector);
+        assertPhysicalDts(other, "keep");
+
+        catalog.dropPartitions(identifier, partitionSpecs("20230101"));
+
+        assertPhysicalDts(other, "keep");
+        catalog.alterTable(
+                other, Collections.singletonList(SchemaChange.removeOption(selector)), false);
+        assertPhysicalDts(identifier, "keep");
+        assertPhysicalDts(other, "keep", "20230101");
+        assertHmsDts(databaseName, tableName, "keep", "20230101", "20230101.done");
+    }
+
+    private void setHistoricalReadSelector(Identifier identifier, String selector)
+            throws Exception {
+        String value = "1";
+        if (selector.equals("scan.tag-name")) {
+            catalog.getTable(identifier).createTag("before", 1L);
+            value = "before";
+        }
+        catalog.alterTable(
+                identifier,
+                Collections.singletonList(SchemaChange.setOption(selector, value)),
+                false);
+    }
+
+    private void writeIntegerChainPartitions(Identifier identifier, int... partitions)
+            throws Exception {
+        BatchWriteBuilder writeBuilder = catalog.getTable(identifier).newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            for (int dt : partitions) {
+                write.write(
+                        GenericRow.of(
+                                dt, BinaryString.fromString("1"), BinaryString.fromString("1")));
+            }
+            commit.commit(write.prepareCommit());
+        }
+    }
+
+    private static Map<String, String> orderedSpec(
+            String key1, String value1, String key2, String value2) {
+        Map<String, String> spec = new LinkedHashMap<>();
+        spec.put(key1, value1);
+        spec.put(key2, value2);
+        return spec;
+    }
+
+    private void writePartitionRow(Identifier identifier, String dt, String pk) throws Exception {
+        BatchWriteBuilder writeBuilder = catalog.getTable(identifier).newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            write.write(
+                    GenericRow.of(
+                            BinaryString.fromString(dt),
+                            BinaryString.fromString(pk),
+                            BinaryString.fromString(pk)));
+            commit.commit(write.prepareCommit());
+        }
+    }
+
+    private void writeAppendPartition(Identifier identifier, String dt) throws Exception {
+        BatchWriteBuilder writeBuilder = catalog.getTable(identifier).newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            write.write(GenericRow.of(0, BinaryString.fromString(dt)));
+            commit.commit(write.prepareCommit());
+        }
+    }
+
+    private static List<Map<String, String>> partitionSpecs(String... dts) {
+        List<Map<String, String>> specs = new ArrayList<>();
+        for (String dt : dts) {
+            specs.add(Collections.singletonMap("dt", dt));
+        }
+        return specs;
+    }
+
+    private void assertHmsDts(String databaseName, String tableName, String... dts)
+            throws Exception {
+        assertThat(
+                        ((HiveCatalog) catalog)
+                                .getHmsClient()
+                                .listPartitions(databaseName, tableName, Short.MAX_VALUE))
+                .extracting(p -> p.getValues().get(0))
+                .containsExactlyInAnyOrder(dts);
+    }
+
+    private void assertPhysicalDts(Identifier identifier, String... dts) throws Exception {
+        FileStoreTable table = (FileStoreTable) catalog.getTable(identifier);
+        if (table instanceof FallbackReadFileStoreTable) {
+            table = ((FallbackReadFileStoreTable) table).wrapped();
+        }
+        assertThat(
+                        table.newScan().listPartitions().stream()
+                                .map(p -> p.getString(0).toString())
+                                .collect(Collectors.toList()))
+                .containsExactlyInAnyOrder(dts);
+    }
+
+    @Test
+    public void testListPartitionsWithDoneStatus() throws Exception {
+        String databaseName = "testListPartitionsWithDoneStatus";
+        catalog.createDatabase(databaseName, false);
+        Identifier identifier = Identifier.create(databaseName, "table");
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(CoreOptions.PARTITION_MARK_DONE_ACTION.key(), "mark-event")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+
+        List<Map<String, String>> partitionSpecs =
+                Arrays.asList(
+                        Collections.singletonMap("dt", "20250101"),
+                        Collections.singletonMap("dt", "20250102"));
+        BatchWriteBuilder writeBuilder = catalog.getTable(identifier).newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            for (Map<String, String> partitionSpec : partitionSpecs) {
+                write.write(GenericRow.of(0, BinaryString.fromString(partitionSpec.get("dt"))));
+            }
+            commit.commit(write.prepareCommit());
+        }
+
+        assertThat(catalog.listPartitions(identifier)).allMatch(partition -> !partition.done());
+
+        catalog.markDonePartitions(identifier, Collections.singletonList(partitionSpecs.get(0)));
+
+        Map<Map<String, String>, Boolean> doneByPartition = new HashMap<>();
+        for (Partition partition : catalog.listPartitions(identifier)) {
+            doneByPartition.put(partition.spec(), partition.done());
+        }
+        assertThat(doneByPartition)
+                .containsEntry(partitionSpecs.get(0), true)
+                .containsEntry(partitionSpecs.get(1), false);
+    }
+
+    @Test
+    public void testCreateTableWithLongColumnComment() throws Exception {
+        String databaseName = "testCreateTableWithLongColumnComment";
+        catalog.createDatabase(databaseName, false);
+
+        String longComment = "line1\n" + repeat('a', 300);
+        String shortComment = "a short comment";
+        Identifier identifier = Identifier.create(databaseName, "table");
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .column("col", DataTypes.INT(), longComment)
+                        .column("col2", DataTypes.INT(), shortComment)
+                        .build(),
+                false);
+
+        // the comment mirrored to the metastore is truncated and contains no line break
+        List<FieldSchema> cols =
+                ((HiveCatalog) catalog)
+                        .getHmsClient()
+                        .getTable(databaseName, "table")
+                        .getSd()
+                        .getCols();
+        assertThat(cols.get(0).getComment()).hasSize(255).endsWith("...").doesNotContain("\n");
+        // a short comment without line breaks is left untouched
+        assertThat(cols.get(1).getComment()).isEqualTo(shortComment);
+
+        // the Paimon schema keeps the original comment
+        assertThat(catalog.getTable(identifier).rowType().getFields())
+                .extracting(DataField::description)
+                .containsExactly(longComment, shortComment);
+    }
+
+    @Test
+    public void testCreateTableWithLongPartitionKeyComment() throws Exception {
+        String databaseName = "testCreateTableWithLongPartitionKeyComment";
+        catalog.createDatabase(databaseName, false);
+
+        // partition key comments are stored in PARTITION_KEYS.PKEY_COMMENT, which allows longer
+        // values than COLUMNS_V2.COMMENT, so they must not be truncated
+        String longComment = repeat('a', 300);
+        Identifier identifier = Identifier.create(databaseName, "table");
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING(), longComment)
+                        .partitionKeys("dt")
+                        .build(),
+                false);
+
+        List<FieldSchema> partitionKeys =
+                ((HiveCatalog) catalog)
+                        .getHmsClient()
+                        .getTable(databaseName, "table")
+                        .getPartitionKeys();
+        assertThat(partitionKeys).hasSize(1);
+        assertThat(partitionKeys.get(0).getComment()).isEqualTo(longComment);
+    }
+
+    private static String repeat(char c, int count) {
+        char[] chars = new char[count];
+        Arrays.fill(chars, c);
+        return new String(chars);
+    }
+
+    @Test
+    public void testCreateTableWithBlob() throws Exception {
+        String databaseName = "testCreateTableWithBlob";
+        catalog.dropDatabase(databaseName, true, true);
+        catalog.createDatabase(databaseName, true);
+        Identifier identifier = Identifier.create(databaseName, "table");
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_TAG_TO_PARTITION.key(), "dt")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .column("picture", DataTypes.BLOB())
+                        .option(CoreOptions.ROW_TRACKING_ENABLED.key(), "true")
+                        .option(CoreOptions.DATA_EVOLUTION_ENABLED.key(), "true")
+                        .build(),
+                true);
+
+        assertThat(catalog.listTables(databaseName)).contains("table");
+    }
+
+    @Test
+    public void testAlterPartitions() throws Exception {
+        if (!supportPartitions()) {
+            return;
+        }
+        String databaseName = "testAlterPartitionTable";
+        catalog.dropDatabase(databaseName, true, true);
+        catalog.createDatabase(databaseName, true);
+        Identifier alterIdentifier = Identifier.create(databaseName, "alert_partitions");
+        catalog.createTable(
+                alterIdentifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(METASTORE_TAG_TO_PARTITION.key(), "dt")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                true);
+        catalog.createPartitions(
+                alterIdentifier,
+                Collections.singletonList(Collections.singletonMap("dt", "20250101")));
+        assertThat(catalog.listPartitions(alterIdentifier).stream().map(Partition::spec))
+                .containsExactlyInAnyOrder(Collections.singletonMap("dt", "20250101"));
+        long fileCreationTime = System.currentTimeMillis();
+        PartitionStatistics partition =
+                new PartitionStatistics(
+                        Collections.singletonMap("dt", "20250101"), 1, 2, 3, fileCreationTime, 4);
+        catalog.alterPartitions(alterIdentifier, Collections.singletonList(partition));
+        Partition partitionFromServer = catalog.listPartitions(alterIdentifier).get(0);
+        checkPartition(
+                new Partition(
+                        Collections.singletonMap("dt", "20250101"),
+                        1,
+                        2,
+                        3,
+                        fileCreationTime,
+                        4,
+                        false),
+                partitionFromServer);
+
+        // Test when table does not exist
+        assertThatExceptionOfType(Catalog.TableNotExistException.class)
+                .isThrownBy(
+                        () ->
+                                catalog.alterPartitions(
+                                        Identifier.create(databaseName, "non_existing_table"),
+                                        Collections.singletonList(partition)));
+    }
+
+    @Test
+    public void testAlterPartitionsOnBranchUpdatesHmsUnderBareTableName() throws Exception {
+        // alterPartitions must call HMS with the bare table name (getTableName), not the
+        // branch-suffixed getObjectName(). A branch identifier's object name is
+        // "tableName$branch_<name>", while the partition is registered in HMS under the bare
+        // table name, so handing the suffixed name to getPartition/alter_partition throws
+        // NoSuchObjectException (swallowed) and the branch partition's statistics are never
+        // updated in HMS.
+        String databaseName = "testAlterPartitionsBranch";
+        catalog.dropDatabase(databaseName, true, true);
+        catalog.createDatabase(databaseName, true);
+        String tableName = "t";
+        Identifier mainId = Identifier.create(databaseName, tableName);
+        catalog.createTable(
+                mainId,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt")
+                        .build(),
+                true);
+
+        Map<String, String> spec = Collections.singletonMap("dt", "20250101");
+        catalog.createPartitions(mainId, Collections.singletonList(spec));
+
+        // Create the branch so loadTableSchema can resolve its schema.
+        ((FileStoreTable) catalog.getTable(mainId)).createBranch("dev");
+
+        // The branch identifier carries the "$branch_<name>" suffix that used to be handed
+        // straight to HMS.
+        Identifier branchId = new Identifier(databaseName, tableName, "dev");
+        assertThat(branchId.getObjectName()).isEqualTo(tableName + "$branch_dev");
+
+        long fileCreationTime = System.currentTimeMillis();
+        PartitionStatistics stats = new PartitionStatistics(spec, 11, 22, 3, fileCreationTime, 4);
+        catalog.alterPartitions(branchId, Collections.singletonList(stats));
+
+        org.apache.hadoop.hive.metastore.api.Partition hmsPartition =
+                ((HiveCatalog) catalog)
+                        .getHmsClient()
+                        .getPartition(
+                                databaseName, tableName, Collections.singletonList("20250101"));
+        Map<String, String> params = hmsPartition.getParameters();
+        // numFiles/totalSize are recomputed by HMS from the (empty) storage descriptor, so assert
+        // the parameters HMS does NOT recompute: numRows and totalBuckets. Before the fix the
+        // branch-suffixed name made getPartition throw NoSuchObjectException (swallowed), so none
+        // of these parameters were ever written.
+        assertThat(params).containsEntry("numRows", "11");
+        assertThat(params).containsEntry("totalBuckets", "4");
+        assertThat(params).containsEntry("lastUpdateTime", String.valueOf(fileCreationTime / 1000));
+    }
+
+    @Override
+    protected boolean supportsAlterDatabase() {
+        return true;
+    }
+
+    @Override
+    protected boolean supportsViewDialects() {
+        return false;
+    }
+}

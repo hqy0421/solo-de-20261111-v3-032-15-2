@@ -1,0 +1,1087 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""Snapshot-pinned PyTorch Dataset for contiguous Paimon row windows."""
+
+import copy
+import hashlib
+import math
+import operator
+import pickle
+import random
+from functools import partial
+from itertools import chain
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+import torch
+from torch.utils.data import Dataset
+
+from pypaimon.common.options.core_options import CoreOptions
+from pypaimon.multimodal.blob_read import fetch_blob_bodies
+from pypaimon.multimodal.query import ScanQuery, _PreFilterQuery
+from pypaimon.multimodal.video import VideoFrameCollator
+from pypaimon.read.datasource.torch_dataset import (
+    SplitRangeIndex,
+    row_ranges_for_split,
+    select_indexed_splits,
+)
+from pypaimon.read.query_auth_split import QueryAuthSplit
+from pypaimon.schema.data_types import (
+    is_array_blob_type, is_blob_file_type, is_map_blob_type,
+)
+from pypaimon.snapshot.time_travel_util import SCAN_KEYS, TimeTravelUtil
+from pypaimon.table.special_fields import SpecialFields
+from pypaimon.utils.range import Range
+
+
+class ContiguousWindowDataset(Dataset):
+    """Map-style training samples from a single table of contiguous frames.
+
+    The in-memory index contains only group values, order bounds, and Paimon
+    row IDs, stored in Arrow and NumPy arrays. Each ``__getitem__`` reads the
+    projected rows from the snapshot resolved while the index was built, reusing
+    that snapshot's authorized scan plan instead of planning again. Within each
+    group, ``order_key`` must contain non-null integers that increase by exactly
+    one; rows from different groups never share a window. ``frame_offsets``
+    selects relative frames independently for each projected column. Unspecified
+    columns use ``[0]``. Alternatively, ``delta_timestamps`` specifies offsets in
+    seconds on a regular grid defined by ``fps``. ``boundary`` handles scheduled
+    anchors whose offsets extend beyond either end of a group:
+
+    * ``drop`` omits them;
+    * ``pad`` repeats the closest endpoint, or uses the column's ``pad_values``;
+    * ``error`` rejects the dataset.
+
+    The result contains scalar group/order values identifying the anchor, a
+    list for each value column (including singleton windows), and a Boolean
+    ``<column>_is_pad`` tensor per column. Offsets retain their order and
+    duplicates. Padding happens before ``column_transforms`` convert each list;
+    ``adapter`` then adapts the complete mapping to a model-specific contract.
+    Both transforms operate on independent copies of the requested values.
+
+    For compatibility, ``window_size`` selects forward consecutive frames for
+    all columns except ``anchor_columns``, which use ``[0]``. These calls retain
+    the original ``tail`` argument and single ``is_pad`` mask in their output.
+    Only one of the three window definitions may be supplied. Without any,
+    every column uses ``[0]``. ``stride`` schedules anchors from each group's
+    first row; boundary handling never shifts that schedule.
+    ``anchor_row_ids`` optionally selects scheduled anchors by Paimon row ID
+    without removing their context. IDs must belong to the context query;
+    duplicates do not repeat samples and selection order does not change the
+    group/order schedule. The query, including its limit, defines group bounds.
+    Restrict it to complete groups to retain the original episode boundaries.
+
+    One scan plans and authorizes the index and all requested value columns.
+    Its split metadata is reused by every projection and DataLoader worker;
+    payloads remain lazy. Authorization is resolved at Dataset construction.
+    ``blob_parallelism`` controls concurrent BLOB reads for each item or batch.
+    Video frame columns retain their descriptors until the requested rows are
+    grouped and decoded, so overlapping windows reuse each physical frame read.
+    """
+
+    _BOUNDARY_POLICIES = ("drop", "pad", "error")
+
+    def __init__(
+            self,
+            query,
+            *,
+            window_size=None,
+            columns=None,
+            anchor_columns=None,
+            group_key="episode_index",
+            order_key="frame_index",
+            stride=1,
+            tail=None,
+            column_transforms=None,
+            pad_values=None,
+            adapter=None,
+            blob_parallelism=64,
+            frame_offsets=None,
+            delta_timestamps=None,
+            fps=None,
+            tolerance_s=None,
+            boundary=None,
+            video_backend=None,
+            anchor_row_ids=None):
+        if not isinstance(query, ScanQuery) or isinstance(query, _PreFilterQuery):
+            raise TypeError(
+                "ContiguousWindowDataset is only supported on scan(), "
+                "not search queries.")
+        self.window_size = (
+            _positive_int(window_size, "window_size")
+            if window_size is not None else None)
+        self.stride = _positive_int(stride, "stride")
+        if sum(value is not None for value in (
+                window_size, frame_offsets, delta_timestamps)) > 1:
+            raise ValueError(
+                "Specify only one of window_size, frame_offsets, "
+                "or delta_timestamps.")
+        if window_size is None and (anchor_columns is not None or tail is not None):
+            raise ValueError("anchor_columns and tail require window_size.")
+        if tail is not None and boundary is not None:
+            raise ValueError("Specify boundary or tail, not both.")
+        self.boundary = boundary if boundary is not None else (
+            tail if tail is not None else "drop")
+        if self.boundary not in self._BOUNDARY_POLICIES:
+            raise ValueError(
+                "boundary must be one of %s; got %r."
+                % (self._BOUNDARY_POLICIES, self.boundary))
+        if self.window_size is not None:
+            self.tail = self.boundary
+        self.group_key = _column(query, group_key, "group_key")
+        self.order_key = _column(query, order_key, "order_key")
+        if self.group_key == self.order_key:
+            raise ValueError("group_key and order_key must name different columns.")
+        if self.window_size is not None and "is_pad" in (self.group_key, self.order_key):
+            raise ValueError("group_key and order_key must not be is_pad.")
+        self.columns = _columns(
+            query, columns, self.group_key, self.order_key)
+        self._video_columns = [
+            name for name in self.columns
+            if name in query._table.options.video_frame_fields()
+        ]
+        if video_backend not in (None, "torchcodec", "pyav"):
+            raise ValueError(
+                "video_backend must be None, 'torchcodec', or 'pyav'.")
+        self.video_backend = video_backend
+        self.anchor_columns = _anchor_columns(anchor_columns, self.columns)
+        self.frame_offsets = _frame_offsets(
+            self.columns, frame_offsets, delta_timestamps, fps, tolerance_s,
+            self.window_size, self.anchor_columns)
+        reserved = {"is_pad"} if self.window_size is not None else {
+            "%s_is_pad" % name for name in self.columns}
+        collisions = reserved.intersection(
+            self.columns + [self.group_key, self.order_key])
+        if collisions:
+            raise ValueError(
+                "Generated padding mask names conflict with output "
+                "columns: %s." % sorted(collisions))
+        self.column_transforms = _column_transforms(
+            column_transforms, self.columns)
+        self.pad_values = _pad_values(pad_values, self.columns)
+        self._read_groups = {}
+        for name, offsets in self.frame_offsets.items():
+            key = (offsets, self.boundary == "pad" and name in self.pad_values)
+            self._read_groups.setdefault(key, []).append(name)
+        if adapter is not None and not callable(adapter):
+            raise TypeError("adapter must be callable or None.")
+        self.adapter = adapter
+        self.blob_parallelism = _positive_int(
+            blob_parallelism, "blob_parallelism")
+
+        if not query._table.options.row_tracking_enabled():
+            raise ValueError(
+                "ContiguousWindowDataset requires row-tracking.enabled=true.")
+
+        index, plan = _read_window_index(
+            query, self.group_key, self.order_key, self.columns)
+        self.snapshot_id = plan.snapshot_id
+        self._table = _pin_table(query._table, self.snapshot_id)
+        self._splits = plan.splits()
+        self._build_index(index, anchor_row_ids)
+        self._reset_read_state()
+
+    def _reset_read_state(self):
+        self._plans = {}
+        self._video_collators = {
+            name: VideoFrameCollator(
+                self._table,
+                video_column=name,
+                decoder_factory=partial(
+                    _open_default_video_decoder, backend=self.video_backend),
+                decode_batch_fn=_decode_video_frames,
+                output_column=name,
+                collate_fn=list,
+                range_parallelism=self.blob_parallelism,
+            )
+            for name in self._video_columns
+        }
+        self._checkpoint_identity = None
+
+    @classmethod
+    def from_query(cls, query, **kwargs):
+        """Build a contiguous-window Dataset from a ``ScanQuery``."""
+        return cls(query, **kwargs)
+
+    @classmethod
+    def _from_anchor_selections(cls, query, anchor_selections, **kwargs):
+        """Share one validated context and authorized plan across a search batch."""
+        if not anchor_selections:
+            return []
+        context = cls(query, anchor_row_ids=dict.fromkeys(chain.from_iterable(anchor_selections)), **kwargs)
+        for name in ("_row_ids", "_group_starts", "_group_lengths", "_group_first_orders"):
+            getattr(context, name).flags.writeable = False
+        # Schedule and check boundaries only once, over the union of selected
+        # anchors. Each view then filters this small schedule, not the context.
+        anchor_ids = pa.array(context._row_ids[
+            context._group_starts[context._anchor_groups] + context._anchor_starts])
+        datasets = []
+        for selected in anchor_selections:
+            mask = pc.is_in(anchor_ids, value_set=pa.array(selected, type=pa.int64())).to_numpy(
+                zero_copy_only=False)
+            dataset = copy.copy(context)
+            dataset._anchor_groups = context._anchor_groups[mask]
+            dataset._anchor_starts = context._anchor_starts[mask]
+            for name in ("columns", "anchor_columns", "_video_columns"):
+                setattr(dataset, name, list(getattr(context, name)))
+            for name in ("frame_offsets", "column_transforms", "pad_values"):
+                setattr(dataset, name, dict(getattr(context, name)))
+            dataset._read_groups = {key: list(columns) for key, columns in context._read_groups.items()}
+            # Readers, decoders and checkpoint identity belong to each view.
+            dataset._reset_read_state()
+            datasets.append(dataset)
+        return datasets
+
+    def __len__(self):
+        return int(self._anchor_groups.size)
+
+    def __getitem__(self, index):
+        """Read one sample, or a list of samples for a Python slice.
+
+        Negative indices follow Python sequence semantics. The return value is
+        the pre-adapter mapping described by the class, or the adapter result
+        when an adapter is configured.
+        """
+        if isinstance(index, slice):
+            return self.__getitems__(range(*index.indices(len(self))))
+        return self.__getitems__([index])[0]
+
+    def __getitems__(self, indices):
+        """Read several Dataset indices while coalescing overlapping row IDs.
+
+        The returned list preserves the requested index order and duplicates.
+        Coalescing affects only physical reads, not logical sample cardinality.
+        """
+        windows = [self._resolve_window(index) for index in indices]
+        if not windows:
+            return []
+        reads = {}
+        for (offsets, constant_pad), columns in self._read_groups.items():
+            plans = [self._column_window(anchor, offsets, constant_pad)
+                     for anchor in windows]
+            row_ids = list(dict.fromkeys(
+                row_id for ids, _ in plans for row_id in ids
+                if row_id is not None))
+            rows = self._read_rows(row_ids, columns) if row_ids else []
+            by_id = dict(zip(row_ids, rows))
+            for name in columns:
+                reads[name] = (plans, by_id)
+        return [
+            self._sample(anchor, position, reads)
+            for position, anchor in enumerate(windows)
+        ]
+
+    def __getstate__(self):
+        # Reuse split metadata in workers, but rebuild process-local readers.
+        state = self.__dict__.copy()
+        state["_plans"] = {}
+        return state
+
+    def state_dict(self):
+        """Return data identity and process state for StatefulDataLoader.
+
+        Rebuild this Dataset with the same retained snapshot, context, anchors,
+        and window settings before loading its state. The loader owns sampler
+        and batch progress; this Dataset never changes its index on restore.
+
+        Python, NumPy and Torch CPU global RNGs are saved for worker transforms.
+        Callbacks with private state must implement both ``state_dict`` and
+        ``load_state_dict``. Keep callback code and preprocessing configuration
+        unchanged; they cannot be inferred from a callable. The training loop
+        must also checkpoint its model, optimizer and main-process/CUDA RNGs.
+        Do not mutate the Dataset's configuration or index after checkpointing.
+        """
+        return {
+            "version": 1,
+            "identity": self._state_identity(),
+            "callbacks": {
+                # A tuple keeps TorchData from flattening dictionary subclasses.
+                name: (copy.deepcopy(callback.state_dict()),)
+                for name, callback in self._stateful_callbacks().items()
+            },
+            "python_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "torch_rng": torch.get_rng_state(),
+        }
+
+    def load_state_dict(self, state_dict):
+        """Reject checkpoints made from a different CWD data contract."""
+        if state_dict.get("version") != 1:
+            raise ValueError("Unsupported CWD checkpoint version.")
+        if state_dict.get("identity") != self._state_identity():
+            raise ValueError(
+                "Cannot restore state from a different CWD: rebuild the same "
+                "table snapshot, context, anchors and window settings.")
+        callbacks = self._stateful_callbacks()
+        if callbacks.keys() != state_dict["callbacks"].keys():
+            raise ValueError("CWD checkpoint has different stateful callbacks.")
+        for name, callback in callbacks.items():
+            callback.load_state_dict(copy.deepcopy(state_dict["callbacks"][name][0]))
+        # Callback restoration may itself consume random numbers.
+        random.setstate(state_dict["python_rng"])
+        np.random.set_state(state_dict["numpy_rng"])
+        torch.set_rng_state(state_dict["torch_rng"])
+
+    def _stateful_callbacks(self):
+        callbacks = {"column:" + name: callback
+                     for name, callback in self.column_transforms.items()}
+        callbacks["adapter"] = self.adapter
+        stateful = {}
+        for name, callback in callbacks.items():
+            save = callable(getattr(callback, "state_dict", None))
+            restore = callable(getattr(callback, "load_state_dict", None))
+            if save != restore:
+                raise TypeError("CWD callback %s must implement both state_dict "
+                                "and load_state_dict." % name)
+            if save:
+                stateful[name] = callback
+        return stateful
+
+    def _state_identity(self):
+        if self._checkpoint_identity is None:
+            snapshot = (TimeTravelUtil.resolve_snapshot(self._table)
+                        if self.snapshot_id is not None else None)
+            masks = sorted(set(
+                tuple(sorted((split.auth_result.column_masking or {}).items()))
+                for split in self._splits if isinstance(split, QueryAuthSplit)))
+            metadata = (
+                self._table.table_path, self._table.current_branch(),
+                self.snapshot_id,
+                (snapshot.uuid, snapshot.base_manifest_list, snapshot.delta_manifest_list)
+                if snapshot is not None else None,
+                self._table.table_schema.id,
+                self.group_key, self.order_key, self._group_keys,
+                self.columns, tuple((name, self.frame_offsets[name]) for name in self.columns),
+                self.window_size, self.stride, self.boundary,
+                _checkpoint_padding(self.pad_values), self.video_backend, masks,
+            )
+            digest = hashlib.sha256()
+            for value in metadata:
+                digest.update(pickle.dumps(value, protocol=4))
+            for array in (self._row_ids, self._group_starts, self._group_lengths,
+                          self._group_first_orders, self._anchor_groups, self._anchor_starts):
+                digest.update(pickle.dumps((array.dtype.str, array.shape), protocol=4))
+                digest.update(memoryview(array))
+            # Worker snapshots are frequent; hash the immutable index only once.
+            self._checkpoint_identity = digest.hexdigest()
+        return self._checkpoint_identity
+
+    def close(self):
+        """Close video decoders opened by this Dataset process."""
+        first_error = None
+        for collator in self._video_collators.values():
+            try:
+                collator.close()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _resolve_window(self, index):
+        index = operator.index(index)
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError("window index out of range")
+
+        group_index = int(self._anchor_groups[index])
+        start = int(self._anchor_starts[index])
+        return group_index, start
+
+    def _column_window(self, anchor, offsets, constant_pad):
+        group_index, start = anchor
+        length = int(self._group_lengths[group_index])
+        group_start = int(self._group_starts[group_index])
+        positions = [start + delta for delta in offsets]
+        padding = [position < 0 or position >= length for position in positions]
+        row_ids = [
+            None if padded and constant_pad else int(self._row_ids[
+                group_start + min(max(position, 0), length - 1)])
+            for position, padded in zip(positions, padding)
+        ]
+        return row_ids, padding
+
+    def _sample(self, anchor, position, reads):
+        group_index, start = anchor
+        sample = {
+            self.group_key: self._group_keys[group_index],
+            self.order_key: int(self._group_first_orders[group_index]) + start,
+        }
+        if self.window_size is not None:
+            available = int(self._group_lengths[group_index]) - start
+            sample["is_pad"] = torch.arange(self.window_size) >= available
+        for name in self.columns:
+            plans, rows = reads[name]
+            row_ids, padding = plans[position]
+            values = [copy.deepcopy(
+                self.pad_values[name] if row_id is None else rows[row_id][name])
+                for row_id in row_ids]
+            if self.window_size is None:
+                sample["%s_is_pad" % name] = torch.tensor(padding, dtype=torch.bool)
+            transform = self.column_transforms.get(name)
+            sample[name] = transform(values) if transform is not None else values
+        if self.adapter is not None:
+            return self.adapter(sample)
+        return sample
+
+    def _build_index(self, index, anchor_row_ids):
+        """Validate index rows, then store row IDs, groups, and window anchors.
+
+        Args:
+            index: Arrow table containing ``group_key``, ``order_key``, and
+                Paimon's ``_ROW_ID`` for the resolved snapshot.
+            anchor_row_ids: Optional selection within the context's row IDs.
+
+        The index is kept as NumPy arrays of row IDs, per-group offsets, and
+        window anchors, plus one Python group value per group. Order values are
+        not stored per row: contiguity makes them the group's first value plus
+        the offset inside the group.
+        """
+        group_column = index.column(self.group_key)
+        order_column = index.column(self.order_key)
+        row_id_column = index.column(SpecialFields.ROW_ID.name)
+        if row_id_column.null_count:
+            raise ValueError(
+                "ContiguousWindowDataset requires readable Paimon row IDs, "
+                "but %s contains null values." % SpecialFields.ROW_ID.name)
+        if group_column.null_count:
+            raise ValueError(
+                "%s must not contain null values." % self.group_key)
+        if order_column.null_count:
+            raise ValueError(
+                "%s must not contain null values." % self.order_key)
+        if not pa.types.is_integer(order_column.type):
+            raise ValueError(
+                "%s must contain integer values." % self.order_key)
+        if pa.types.is_floating(group_column.type) and pc.any(
+                pc.is_nan(group_column)).as_py():
+            raise ValueError(
+                "%s must not contain NaN values, which never compare equal to "
+                "themselves and would split one group." % self.group_key)
+
+        try:
+            ordered = index.sort_by([
+                (self.group_key, "ascending"),
+                (self.order_key, "ascending"),
+            ])
+        except pa.ArrowNotImplementedError:
+            raise ValueError(
+                "%s values must be mutually orderable." % self.group_key)
+
+        group_values = _contiguous_array(ordered.column(self.group_key))
+        order_values = _integer_numpy(
+            _contiguous_array(ordered.column(self.order_key)))
+        self._row_ids = _integer_numpy(
+            _contiguous_array(ordered.column(SpecialFields.ROW_ID.name)))
+        self._group_starts = _group_starts(group_values)
+        self._group_lengths = np.diff(
+            np.append(self._group_starts, len(self._row_ids)))
+        self._group_keys = group_values.take(
+            pa.array(self._group_starts, type=pa.int64())).to_pylist()
+        self._group_first_orders = order_values[self._group_starts]
+        self._validate_contiguity(order_values)
+        anchor_mask = _anchor_mask(
+            ordered.column(SpecialFields.ROW_ID.name), anchor_row_ids)
+        self._anchor_groups, self._anchor_starts = self._build_anchors(anchor_mask)
+
+    def _validate_contiguity(self, order_values):
+        if len(order_values) < 2:
+            return
+        same_group = np.ones(len(order_values) - 1, dtype=bool)
+        same_group[self._group_starts[1:] - 1] = False
+        steps = np.diff(order_values)
+        duplicate = same_group & (steps == 0)
+        if duplicate.any():
+            position = int(np.flatnonzero(duplicate)[0])
+            raise ValueError(
+                "Group %s has duplicate order value %r in %s."
+                % (self._group_of(position),
+                   int(order_values[position]), self.order_key))
+        broken = same_group & (steps != 1)
+        if broken.any():
+            position = int(np.flatnonzero(broken)[0])
+            raise ValueError(
+                "Group %s is not contiguous in %s: %s followed by %s."
+                % (self._group_of(position), self.order_key,
+                   int(order_values[position]), int(order_values[position + 1])))
+
+    def _group_of(self, position):
+        group_index = int(np.searchsorted(
+            self._group_starts, position, side="right")) - 1
+        return self._group_keys[group_index]
+
+    def _build_anchors(self, anchor_mask):
+        groups = []
+        starts = []
+        minimum = min(min(offsets) for offsets in self.frame_offsets.values())
+        maximum = max(max(offsets) for offsets in self.frame_offsets.values())
+        # Legacy windows schedule their full horizon even with anchor-only
+        # columns, so their cardinality and global mask remain unchanged.
+        if self.window_size is not None:
+            maximum = max(maximum, self.window_size - 1)
+        for group_index, length in enumerate(self._group_lengths):
+            length = int(length)
+            positions = np.arange(0, length, self.stride, dtype=np.int64)
+            if anchor_mask is not None:
+                positions = positions[
+                    anchor_mask[self._group_starts[group_index] + positions]]
+            lower = min(length, max(0, -minimum))
+            upper = max(0, min(length, length - maximum))
+            valid = (positions >= lower) & (positions < upper)
+            incomplete = np.flatnonzero(~valid)
+            if incomplete.size:
+                if self.boundary == "error":
+                    first = int(incomplete[0])
+                    size = "window_size=%s, " % self.window_size \
+                        if self.window_size is not None else ""
+                    raise ValueError(
+                        "Group %s has an incomplete window at %s: "
+                        "%soffset bounds=[%d, %d]."
+                        % (self._group_keys[group_index],
+                           int(self._group_first_orders[group_index])
+                           + int(positions[first]),
+                           size, minimum, maximum))
+                if self.boundary == "drop":
+                    positions = positions[valid]
+            if positions.size:
+                groups.append(np.full(positions.size, group_index, dtype=np.int64))
+                starts.append(positions)
+        if not groups:
+            empty = np.zeros(0, dtype=np.int64)
+            return empty, empty.copy()
+        return np.concatenate(groups), np.concatenate(starts)
+
+    def _read_rows(self, row_ids, columns=None):
+        """Read projected rows by ID from the pinned snapshot.
+
+        Args:
+            row_ids: Paimon row IDs to read. Their order and duplicates define
+                the returned row order.
+            columns: Projected value columns, or all Dataset columns when
+                omitted.
+
+        Returns:
+            A list of row dictionaries aligned one-for-one with ``row_ids``.
+            The internal ``_ROW_ID`` field is removed. Ordinary BLOB
+            descriptors are resolved to their bodies, while video descriptors
+            are decoded to frames.
+        """
+        columns = self.columns if columns is None else columns
+        rows = self._plan_for(columns).read(row_ids)
+        for name in columns:
+            collator = self._video_collators.get(name)
+            if collator is not None:
+                rows = collator(rows)
+        row_id_column = SpecialFields.ROW_ID.name
+        by_row_id = {}
+        for row in rows:
+            by_row_id[int(row.pop(row_id_column))] = row
+        missing = [row_id for row_id in row_ids if row_id not in by_row_id]
+        if missing:
+            raise RuntimeError(
+                "Pinned snapshot %s did not return indexed row IDs %s."
+                % (self.snapshot_id, missing))
+        return [by_row_id[row_id] for row_id in row_ids]
+
+    def _plan_for(self, columns):
+        key = tuple(columns)
+        plan = self._plans.get(key)
+        if plan is None:
+            tag_name = self._table.options.scan_tag_name()
+            if tag_name is not None and self.snapshot_id is not None:
+                _require_tag_snapshot(self._table, tag_name, self.snapshot_id)
+            plan = _PinnedRowIdPlan(
+                self._table,
+                columns,
+                self.blob_parallelism,
+                self._splits,
+                self._video_columns,
+            )
+            self._plans[key] = plan
+        return plan
+
+
+def _checkpoint_padding(value):
+    # Tensor's default pickle includes storage identity, even for equal values.
+    if isinstance(value, torch.Tensor):
+        raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        return ("tensor", str(value.dtype), tuple(value.shape), str(value.device),
+                value.requires_grad, raw.numpy().tobytes())
+    if type(value) is dict:
+        return ("dict", tuple(sorted(
+            (_checkpoint_padding(key), _checkpoint_padding(item))
+            for key, item in value.items())))
+    if type(value) in (list, tuple):
+        return (type(value).__name__, tuple(_checkpoint_padding(item) for item in value))
+    if type(value) is np.ndarray:
+        value = value.copy(order="C")
+    return ("pickle", pickle.dumps(value, protocol=4))
+
+
+class _PinnedRowIdPlan:
+    """Read a projection from the window context's authorized splits by row ID.
+
+    Every read narrows the shared splits to the requested row ranges. Neither
+    new projections nor workers need to revisit the snapshot's manifests.
+    """
+
+    def __init__(
+            self,
+            table,
+            columns,
+            blob_parallelism,
+            splits,
+            video_columns=()):
+        self._blob_parallelism = blob_parallelism
+        self._blob_columns = [
+            field.name for field in table.fields
+            if field.name in columns
+            and is_blob_file_type(field.type)
+        ]
+        self._body_blob_columns = [
+            name for name in self._blob_columns if name not in video_columns
+        ]
+        self._map_blob_columns = {
+            field.name for field in table.fields
+            if field.name in self._body_blob_columns
+            and is_map_blob_type(field.type)
+        }
+        self._array_blob_columns = {
+            field.name for field in table.fields
+            if field.name in self._body_blob_columns
+            and is_array_blob_type(field.type)
+        }
+        blob_column_set = set(self._blob_columns)
+        self._projection = (
+            [name for name in columns if name not in blob_column_set]
+            + [SpecialFields.ROW_ID.name]
+            + self._blob_columns
+        )
+        self._table = (
+            table.copy({CoreOptions.BLOB_AS_DESCRIPTOR.key(): "true"})
+            if self._blob_columns else table
+        )
+        self._splits = splits
+        self._split_ranges = [
+            row_ranges_for_split(split) for split in self._splits
+        ]
+        self._split_range_index = SplitRangeIndex(self._split_ranges)
+
+    def read(self, row_ids):
+        """Return raw row dictionaries, including ``_ROW_ID``, for ``row_ids``."""
+        requested = list(dict.fromkeys(row_ids))
+        ranges = Range.to_ranges(requested)
+        splits = select_indexed_splits(
+            self._splits, self._split_ranges, self._split_range_index, ranges)
+        if not splits:
+            return []
+        # IndexedSplit already pushes the row ranges into the readers. Avoid
+        # running a second predicate scanner over the same selected rows.
+        arrow = self._new_read_builder().new_read().to_arrow(splits)
+        # Row ranges are merged per split, so a read can still return rows
+        # between requested IDs; drop them before BLOB bodies are fetched.
+        row_id_column = arrow.column(SpecialFields.ROW_ID.name)
+        arrow = arrow.filter(pc.is_in(
+            row_id_column,
+            value_set=pa.array(requested, type=row_id_column.type)))
+        if not self._body_blob_columns:
+            return arrow.to_pylist()
+
+        bodies = fetch_blob_bodies(
+            self._table.file_io,
+            arrow.select(self._body_blob_columns).to_pydict(),
+            self._body_blob_columns,
+            self._blob_parallelism,
+            self._map_blob_columns,
+            self._array_blob_columns)
+        blob_column_set = set(self._body_blob_columns)
+        rows = arrow.select([
+            name for name in arrow.column_names if name not in blob_column_set
+        ]).to_pylist()
+        for name in self._body_blob_columns:
+            values = bodies[name]
+            if len(values) != len(rows):
+                raise RuntimeError(
+                    "BLOB column %s is not row-aligned with a window read."
+                    % name)
+            for row, value in zip(rows, values):
+                row[name] = value
+        return rows
+
+    def _new_read_builder(self):
+        return self._table.new_read_builder().with_projection(self._projection)
+
+
+def _masked_columns(split):
+    if not isinstance(split, QueryAuthSplit):
+        return ()
+    masking = getattr(split.auth_result, "column_masking", None)
+    return tuple(masking) if masking else ()
+
+
+def _reject_masked_row_ids(splits):
+    for split in splits:
+        if SpecialFields.ROW_ID.name in _masked_columns(split):
+            raise ValueError(
+                "ContiguousWindowDataset requires readable Paimon row IDs, but "
+                "query authorization masks %s for this table; read the rows "
+                "with scan().to_arrow() instead."
+                % SpecialFields.ROW_ID.name)
+
+
+def _reject_masked_index_keys(splits, group_key, order_key):
+    for split in splits:
+        masked = _masked_columns(split)
+        keys = [name for name in (group_key, order_key) if name in masked]
+        if keys:
+            raise ValueError(
+                "ContiguousWindowDataset groups and orders rows by %s, but "
+                "query authorization masks %s for this table; a mask can merge "
+                "distinct groups or break contiguity, so its windows would no "
+                "longer follow the stored rows."
+                % ([group_key, order_key], keys))
+
+
+def _contiguous_array(column):
+    combined = column.combine_chunks()
+    if not isinstance(combined, pa.ChunkedArray):
+        return combined
+    if combined.num_chunks == 1:
+        return combined.chunk(0)
+    if not combined.num_chunks:
+        return pa.nulls(0, type=combined.type)
+    return pa.concat_arrays(list(combined.iterchunks()))
+
+
+def _integer_numpy(array):
+    # Cast narrow widths so differences of adjacent values cannot overflow.
+    if not pa.types.is_uint64(array.type):
+        array = array.cast(pa.int64())
+    return array.to_numpy(zero_copy_only=False)
+
+
+def _group_starts(group_values):
+    count = len(group_values)
+    if not count:
+        return np.zeros(0, dtype=np.int64)
+    changed = pc.not_equal(
+        group_values.slice(1), group_values.slice(0, count - 1))
+    return np.concatenate((
+        [0],
+        np.flatnonzero(changed.to_numpy(zero_copy_only=False)) + 1,
+    )).astype(np.int64, copy=False)
+
+
+def _anchor_mask(row_ids, selection):
+    if selection is None:
+        return None
+    selected = []
+    maximum = np.iinfo(np.int64).max
+    for value in selection:
+        if isinstance(value, (bool, np.bool_)):
+            raise TypeError("anchor_row_ids must contain integers, not booleans.")
+        try:
+            row_id = operator.index(value)
+        except TypeError:
+            raise TypeError("anchor_row_ids must contain integer row IDs.")
+        if not 0 <= row_id <= maximum:
+            raise ValueError("anchor_row_ids must contain nonnegative int64 row IDs.")
+        selected.append(row_id)
+    selected = pa.array(selected, type=pa.int64())
+    mask = pc.is_in(row_ids, value_set=selected)
+    missing = selected.filter(pc.invert(pc.is_in(
+        selected, value_set=row_ids.filter(mask))))
+    if len(missing):
+        raise ValueError(
+            "anchor_row_ids contains IDs outside the context query: %s."
+            % missing.slice(0, 10).to_pylist())
+    return mask.to_numpy(zero_copy_only=False)
+
+
+def _read_window_index(query, group_key, order_key, columns):
+    index_query = copy.copy(query)
+    index_columns = [group_key, order_key, SpecialFields.ROW_ID.name]
+    # Plan all requested columns: native planning may prune DE column files,
+    # and authorization must cover payload columns as well as the index.
+    index_query._projection = index_columns + list(columns)
+    index_query._include_row_id = True
+    read_builder = index_query._configured_read_builder()
+    plan = read_builder.new_scan().plan()
+    splits = plan.splits()
+    _reject_masked_row_ids(splits)
+    _reject_masked_index_keys(splits, group_key, order_key)
+    index = read_builder.with_projection(index_columns).new_read().to_arrow(splits)
+    if index.num_rows and plan.snapshot_id is None:
+        raise RuntimeError("Cannot pin the snapshot used to build the window index.")
+    return index, plan
+
+
+def _pin_table(table, snapshot_id):
+    """Pin a table copy to ``snapshot_id``, or reuse it when unresolved.
+
+    A scan already pinned by ``scan.tag-name`` keeps that tag: the tag retains
+    its snapshot's metadata after the main snapshot file expires, which reading
+    by raw snapshot ID cannot.
+    """
+    if snapshot_id is None:
+        return table
+    captured = getattr(table, "_read_snapshot", None)
+    if captured is not None and captured.id == snapshot_id:
+        # Search already captured the complete read view. Replacing it with
+        # a raw ID would lose tag-retained metadata after snapshot expiration.
+        return table
+    tag_name = table.options.scan_tag_name()
+    if tag_name is not None:
+        _require_tag_snapshot(table, tag_name, snapshot_id)
+    scan_keys = set(SCAN_KEYS + CoreOptions.INCREMENTAL_SCAN_KEYS)
+    scan_keys.update(option.key() for option in (
+        CoreOptions.SCAN_MODE,
+        CoreOptions.SCAN_FILE_CREATION_TIME_MILLIS,
+        CoreOptions.SCAN_CREATION_TIME_MILLIS,
+    ))
+    if tag_name is not None:
+        scan_keys.discard(CoreOptions.SCAN_TAG_NAME.key())
+    options = {
+        key: None for key in scan_keys
+        if table.options.options.contains_key(key)
+    }
+    if tag_name is None:
+        options[CoreOptions.SCAN_SNAPSHOT_ID.key()] = str(snapshot_id)
+    if not options:
+        return table
+    return table.copy(options)
+
+
+def _require_tag_snapshot(table, tag_name, snapshot_id):
+    tag = table.tag_manager().get(tag_name)
+    if tag is None:
+        raise RuntimeError(
+            "Tag %r used to build the window index no longer exists." % tag_name)
+    resolved = tag.trim_to_snapshot().id
+    if resolved != snapshot_id:
+        raise RuntimeError(
+            "Tag %r now resolves to snapshot %s, but the window index was "
+            "built from snapshot %s; the pinned snapshot moved."
+            % (tag_name, resolved, snapshot_id))
+
+
+def _open_default_video_decoder(stream, backend=None):
+    # Keep the codec implementation shared with PaimonLeRobotDataset while the
+    # generic collator owns grouping, range reads, and process-local caching.
+    from pypaimon.multimodal.lerobot.dataset import _open_video_decoder
+    return _open_video_decoder(stream, backend=backend)
+
+
+def _decode_video_frames(decoder, frame_indices, unused_rows):
+    get_frames_at = getattr(decoder, "get_frames_at", None)
+    if get_frames_at is not None:
+        frames = get_frames_at(indices=frame_indices).data
+        # Iterating a batched tensor returns views backed by the whole batch.
+        # Give each row compact storage before window assembly deep-copies it.
+        return [frame.clone() for frame in frames]
+    return [decoder[index] for index in frame_indices]
+
+
+def _frame_offsets(columns, offsets, timestamps, fps, tolerance_s,
+                   window_size, anchor_columns):
+    """Normalize the public window forms to nonempty integer offset tuples."""
+    if timestamps is not None:
+        tolerance = _finite_number(
+            1e-4 if tolerance_s is None else tolerance_s, "tolerance_s")
+        if tolerance < 0:
+            raise ValueError("tolerance_s must be non-negative.")
+        if fps is None:
+            raise ValueError("delta_timestamps requires an explicit fps.")
+        fps = _finite_number(fps, "fps")
+        if fps <= 0:
+            raise ValueError("fps must be positive.")
+    elif fps is not None or tolerance_s is not None:
+        raise ValueError("fps and tolerance_s are only used with delta_timestamps.")
+    if window_size is not None:
+        forward = tuple(range(window_size))
+        return {
+            name: (0,) if name in anchor_columns else forward
+            for name in columns
+        }
+    parameter = "delta_timestamps" if timestamps is not None else "frame_offsets"
+    supplied = _mapping(timestamps if timestamps is not None else offsets, parameter)
+    _validate_mapping_columns(supplied, columns, parameter)
+    result = {}
+    for name in columns:
+        if name not in supplied:
+            result[name] = (0,)
+            continue
+        values = supplied[name]
+        if isinstance(values, (str, bytes, dict)):
+            raise TypeError("%s[%r] must be a sequence of offsets." % (parameter, name))
+        try:
+            values = list(values)
+        except TypeError:
+            raise TypeError("%s[%r] must be a sequence of offsets." % (parameter, name))
+        if not values:
+            raise ValueError("%s[%r] must not be empty." % (parameter, name))
+        converted = []
+        for value in values:
+            if timestamps is not None:
+                seconds = _finite_number(value, "delta_timestamps[%r]" % name)
+                scaled = seconds * fps
+                if not math.isfinite(scaled):
+                    raise ValueError("delta_timestamps * fps must be finite.")
+                delta = round(scaled)
+                if abs(seconds - delta / fps) > tolerance:
+                    raise ValueError(
+                        "delta_timestamps for %s must align to multiples of 1/fps."
+                        % name)
+            else:
+                if isinstance(value, (bool, np.bool_)):
+                    raise TypeError("frame_offsets must contain integers, not booleans.")
+                try:
+                    delta = operator.index(value)
+                except TypeError:
+                    raise TypeError("frame_offsets must contain integer offsets.")
+            converted.append(delta)
+        result[name] = tuple(converted)
+    return result
+
+
+def _finite_number(value, name):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError("%s must be a finite number, not a boolean." % name)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("%s must be a finite number." % name)
+    if not math.isfinite(number):
+        raise ValueError("%s must be a finite number." % name)
+    return number
+
+
+def _columns(query, columns, group_key, order_key):
+    available = {field.name for field in query._table.fields}
+    if columns is None:
+        if query._projection is None:
+            columns = [field.name for field in query._table.fields]
+        else:
+            columns = list(query._projection)
+        columns = [name for name in columns
+                   if name not in (group_key, order_key)]
+    elif isinstance(columns, str):
+        columns = [columns]
+    else:
+        try:
+            columns = list(columns)
+        except TypeError:
+            raise TypeError(
+                "columns must be a non-empty sequence of column names.")
+    if not columns:
+        raise ValueError("columns must contain at least one value column.")
+    if any(not isinstance(name, str) or not name for name in columns):
+        raise TypeError("columns must contain only non-empty column names.")
+    if len(set(columns)) != len(columns):
+        raise ValueError("columns must not contain duplicates.")
+    invalid = [name for name in columns if name not in available]
+    if invalid:
+        raise ValueError("columns do not exist: %s." % invalid)
+    reserved = [name for name in columns
+                if name in (group_key, order_key)]
+    if reserved:
+        raise ValueError(
+            "columns must not include group_key or order_key: %s."
+            % reserved)
+    return columns
+
+
+def _anchor_columns(value, columns):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    else:
+        try:
+            value = list(value)
+        except TypeError:
+            raise TypeError(
+                "anchor_columns must be a sequence of projected column names.")
+    if any(not isinstance(name, str) or not name for name in value):
+        raise TypeError(
+            "anchor_columns must contain only non-empty column names.")
+    if len(set(value)) != len(value):
+        raise ValueError("anchor_columns must not contain duplicates.")
+    invalid = [name for name in value if name not in columns]
+    if invalid:
+        raise ValueError(
+            "anchor_columns must be included in columns: %s." % invalid)
+    return value
+
+
+def _column_transforms(value, columns):
+    transforms = _mapping(value, "column_transforms")
+    _validate_mapping_columns(transforms, columns, "column_transforms")
+    invalid = [name for name, transform in transforms.items()
+               if not callable(transform)]
+    if invalid:
+        raise TypeError(
+            "column_transforms values must be callable: %s." % invalid)
+    return transforms
+
+
+def _pad_values(value, columns):
+    values = _mapping(value, "pad_values")
+    _validate_mapping_columns(values, columns, "pad_values")
+    return values
+
+
+def _mapping(value, name):
+    if value is None:
+        return {}
+    try:
+        return dict(value)
+    except (TypeError, ValueError):
+        raise TypeError("%s must be a mapping or None." % name)
+
+
+def _validate_mapping_columns(value, columns, name):
+    invalid = [column for column in value if column not in columns]
+    if invalid:
+        raise ValueError("%s contains unknown columns: %s." % (name, invalid))
+
+
+def _column(query, value, name):
+    if not isinstance(value, str) or not value:
+        raise TypeError("%s must be a non-empty column name." % name)
+    available = {field.name for field in query._table.fields}
+    if value not in available:
+        raise ValueError("%s column %r does not exist." % (name, value))
+    return value
+
+
+def _positive_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("%s must be a positive int." % name)
+    return value
+
+
+__all__ = ["ContiguousWindowDataset"]

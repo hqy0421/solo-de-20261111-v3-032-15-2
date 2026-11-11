@@ -1,0 +1,138 @@
+################################################################################
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+################################################################################
+
+"""Classification of Paimon files."""
+
+import logging
+import os
+from enum import Enum
+
+logger = logging.getLogger(__name__)
+
+
+class FileType(Enum):
+    """Classification of Paimon files.
+
+    - META: snapshot, schema, manifest, manifest sidecar, statistics, tag, changelog metadata,
+            hint files, _SUCCESS, consumer, service files
+    - DATA: data files and any unrecognized files (default)
+    - STRUCTURED_DATA: block-cache-readable Parquet, ORC, Avro, ROW and Mosaic files
+    - BUCKET_INDEX: bucket level index files (Hash, DV)
+    - GLOBAL_INDEX: table level global index files (btree, lumina, full-text)
+    - FILE_INDEX: data-file index files (bloom filter, bitmap, etc.)
+    """
+    META = "META"
+    DATA = "DATA"
+    STRUCTURED_DATA = "STRUCTURED_DATA"
+    BUCKET_INDEX = "BUCKET_INDEX"
+    GLOBAL_INDEX = "GLOBAL_INDEX"
+    FILE_INDEX = "FILE_INDEX"
+
+    def is_index(self) -> bool:
+        return self in (FileType.BUCKET_INDEX, FileType.GLOBAL_INDEX, FileType.FILE_INDEX)
+
+    @staticmethod
+    def is_mutable(file_path: str) -> bool:
+        """Returns True if the file may be rewritten in place and must not be cached."""
+        name = os.path.basename(file_path)
+        # temp files (.{name}.{UUID}.tmp) are still being written
+        if FileType._unwrap_temp_file_name(name) != name:
+            return True
+        # hint, _SUCCESS, consumer, service, tag and Iceberg-compatible metadata (version-hint,
+        # retire-pending, v{N}.metadata.json on tag changes) are overwritten in place
+        return (name in ("EARLIEST", "LATEST", "_SUCCESS", "version-hint.text", "retire-pending")
+                or name.endswith(("_SUCCESS", ".metadata.json"))
+                or name.startswith(("consumer-", "service-", "tag-")))
+
+    @staticmethod
+    def classify(file_path: str) -> 'FileType':
+        name = os.path.basename(file_path)
+        name = FileType._unwrap_temp_file_name(name)
+
+        if (name.startswith("snapshot-")
+                or name.startswith("schema-")
+                or name.startswith("stat-")
+                or name.startswith("tag-")
+                or name.startswith("consumer-")
+                or name.startswith("service-")):
+            return FileType.META
+
+        if name.endswith(".index"):
+            if "global-index-" in name:
+                return FileType.GLOBAL_INDEX
+            return FileType.FILE_INDEX
+
+        if "manifest" in name or name.endswith(".avro.sidecar"):
+            return FileType.META
+
+        if name.startswith("index-"):
+            return FileType.BUCKET_INDEX
+
+        if name in ("EARLIEST", "LATEST"):
+            return FileType.META
+
+        if name == "_SUCCESS" or name.endswith("_SUCCESS"):
+            return FileType.META
+
+        if name.startswith("changelog-"):
+            parent = os.path.basename(os.path.dirname(file_path))
+            if parent == "changelog":
+                return FileType.META
+
+        stem, _, extension = name.rpartition('.')
+        if stem and extension.lower() in ('parquet', 'orc', 'avro', 'row', 'mosaic'):
+            return FileType.STRUCTURED_DATA
+
+        return FileType.DATA
+
+    @staticmethod
+    def parse_whitelist(whitelist_str: str) -> set:
+        mapping = {
+            "meta": (FileType.META,),
+            "global-index": (FileType.GLOBAL_INDEX,),
+            "bucket-index": (FileType.BUCKET_INDEX,),
+            "data": (FileType.DATA, FileType.STRUCTURED_DATA),
+            "structured-data": (FileType.STRUCTURED_DATA,),
+            "file-index": (FileType.FILE_INDEX,),
+        }
+        result = set()
+        for name in whitelist_str.split(","):
+            name = name.strip()
+            if name == "*":
+                result.update(FileType)
+            elif name in mapping:
+                result.update(mapping[name])
+            elif name:
+                logger.warning(
+                    "Unknown local-cache.whitelist value '%s'. "
+                    "Supported values: meta, global-index, bucket-index, data, "
+                    "structured-data, file-index, or * for all of them.",
+                    name,
+                )
+        return result
+
+    @staticmethod
+    def _unwrap_temp_file_name(name: str) -> str:
+        # format: .{originalName}.{UUID}.tmp
+        # suffix ".{UUID}.tmp" is 41 chars: 1(dot) + 36(UUID) + 4(.tmp)
+        if len(name) < 43 or name[0] != '.' or not name.endswith('.tmp'):
+            return name
+        dot_before_uuid = len(name) - 41
+        if name[dot_before_uuid] != '.':
+            return name
+        return name[1:dot_before_uuid]

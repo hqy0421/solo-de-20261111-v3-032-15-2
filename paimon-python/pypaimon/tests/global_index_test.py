@@ -1,0 +1,619 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import pyarrow as pa
+import pytest
+
+from pypaimon import CatalogFactory, Schema
+from pypaimon.common.options.core_options import CoreOptions, GlobalIndexSearchMode
+from pypaimon.common.options.options import Options
+from pypaimon.common.options.vector_index_options import VectorIndexOptions
+from pypaimon.common.predicate import Predicate
+from pypaimon.common.predicate_builder import PredicateBuilder
+from pypaimon.globalindex.global_index_meta import GlobalIndexMeta
+from pypaimon.execution.python.globalindex.global_index_evaluator import GlobalIndexEvaluation
+from pypaimon.globalindex.global_index_result import GlobalIndexResult
+from pypaimon.index.index_file_meta import IndexFileMeta
+from pypaimon.index.index_file_handler import IndexFileHandler
+from pypaimon.read.read_dispatch import _python_scan_execution
+from pypaimon.schema.data_types import AtomicType, DataField
+from pypaimon.snapshot.snapshot_manager import SnapshotManager
+from pypaimon.tests.data_evolution_test_helpers import (
+    BatchModeMixin,
+    DataEvolutionTestBase,
+)
+from pypaimon.utils.roaring_bitmap import RoaringBitmap64
+from pypaimon.utils.range import Range
+
+
+class GlobalIndexTest(unittest.TestCase):
+
+    def test_generic_merge_does_not_interpret_vector_parameters(self):
+        values = {'fields.embedding.index-options': '{"metric":"INNER-PRODUCT","nlist":64}'}
+        resolved = CoreOptions(Options(values)).global_index_options('ivf-pq', 'embedding').to_map()
+        self.assertEqual('INNER-PRODUCT', resolved['ivf-pq.metric'])
+        self.assertNotIn('ivf-pq.distance.metric', resolved)
+        self.assertNotIn('ivf-pq.metric', CoreOptions(Options({})).global_index_options(
+            'ivf-pq', 'embedding').to_map())
+
+    def test_legacy_primary_key_metric_resolution_is_idempotent(self):
+        for metric in ('COSINE', 'inner-product', 'L2'):
+            with self.subTest(metric=metric):
+                values = {'pk-vector.index.columns': 'embedding',
+                          'fields.embedding.pk-vector.index.type': 'ivf-pq',
+                          'fields.embedding.pk-vector.distance.metric': metric.lower().replace('-', '_'),
+                          'fields.embedding.pk-vector.index.options': '{"metric":"%s"}' % metric}
+                first = VectorIndexOptions.resolve(Options(values), None, 'embedding').options
+                second = VectorIndexOptions.resolve(first, 'ivf-pq', 'embedding').options
+                self.assertEqual(first.to_map(), second.to_map())
+                self.assertEqual('{"metric":"%s"}' % metric,
+                                 values['fields.embedding.pk-vector.index.options'])
+
+    def test_shared_index_column_precedence_and_legacy_fallback(self):
+        for index_type, legacy in (("btree", "btree"), ("bitmap", "bitmap"),
+                                   ("full-text", "full-text"), ("ivf-pq", "vector"),
+                                   ("fm", "fm"), ("multivalue", "multivalue")):
+            with self.subTest(index_type=index_type):
+                values = {"pk-%s.index.columns" % legacy: "old",
+                          "fields.old.pk-vector.index.type": "ivf-pq"}
+                core = CoreOptions(Options(values))
+                columns = (VectorIndexOptions.columns(core.options) if CoreOptions._is_vector_index_type(index_type)
+                           else core.global_index_columns(index_type))
+                self.assertEqual(["old"], columns)
+                values["global-index.%s.index-column" % index_type] = "single"
+                self.assertEqual(["single"], CoreOptions(Options(values)).global_index_columns(index_type))
+                values["global-index.%s.index-columns" % index_type] = " first, second "
+                core = CoreOptions(Options(values))
+                self.assertEqual(["first", "second"], core.global_index_columns(index_type))
+                self.assertEqual([index_type], core.global_index_types())
+
+    def test_shared_field_options_override_type_defaults(self):
+        for index_type, prefix, key in (("btree", "btree-index.", "block-size"),
+                                        ("bitmap", "bitmap-index.", "dictionary-block-size"),
+                                        ("full-text", "full-text.", "tokenizer"),
+                                        ("ivf-pq", "ivf-pq.", "nlist")):
+            with self.subTest(index_type=index_type):
+                values = {prefix + key: "old",
+                          "fields.payload.index-options": '{"%s":"new"}' % key,
+                          "sorted-index.records-per-file": "20"}
+                core = CoreOptions(Options(values))
+                resolved = core.global_index_options(index_type, "payload").to_map()
+                self.assertEqual("new", resolved[prefix + key])
+                self.assertEqual("20", resolved["sorted-index.records-per-file"])
+                self.assertEqual("old", values[prefix + key])
+
+    def test_shared_vector_type_and_documented_metric(self):
+        values = {"global-index.ivf-pq.index-columns": "embedding",
+                  "pk-vector.index.columns": "old",
+                  "fields.embedding.pk-vector.index.type": "diskann",
+                  "ivf-pq.distance.metric": "l2",
+                  "ivf-pq.dimension": "768",
+                  "fields.embedding.nlist": "48",
+                  "fields.embedding.distance.metric": "cosine"}
+        core = CoreOptions(Options(values))
+        self.assertEqual(["embedding"], VectorIndexOptions.columns(core.options))
+        self.assertEqual("ivf-pq", VectorIndexOptions.resolve(
+            core.options, None, "embedding", default_metric=False).index_type)
+        self.assertEqual("cosine", VectorIndexOptions.resolve(core.options, None, "embedding").metric)
+        values["fields.embedding.index-options"] = '{"nlist":64,"distance.metric":"inner_product"}'
+        core = CoreOptions(Options(values))
+        self.assertEqual("inner_product", VectorIndexOptions.resolve(core.options, None, "embedding").metric)
+        resolved = VectorIndexOptions.resolve(core.options, None, "embedding").options.to_map()
+        self.assertEqual("768", resolved["ivf-pq.dimension"])
+        self.assertEqual("64", resolved["fields.embedding.nlist"])
+        self.assertEqual("inner_product", resolved["ivf-pq.distance.metric"])
+
+    def test_shared_field_options_reject_invalid_values(self):
+        for serialized in ('[]', '{"nlist":null}', '{"":64}', 'invalid'):
+            with self.subTest(serialized=serialized):
+                core = CoreOptions(Options({"fields.embedding.index-options": serialized}))
+                with self.assertRaisesRegex(ValueError, 'fields.embedding.index-options'):
+                    core.global_index_options("ivf-pq", "embedding")
+
+    def test_primary_key_sorted_index_columns_preserve_java_split_semantics(self):
+        options = CoreOptions(Options({
+            "pk-btree.index.columns": "name, id",
+            "pk-bitmap.index.columns": "category",
+        }))
+
+        self.assertEqual(["name", "id"], options.btree_index_columns())
+        self.assertEqual(["category"], options.bitmap_index_columns())
+
+    def test_global_index_meta_preserves_primary_key_source_meta(self):
+        source_meta = b"\x00\x00\x00\x01source-file"
+        meta = GlobalIndexMeta(
+            row_range_start=0,
+            row_range_end=2,
+            index_field_id=1,
+            source_meta=source_meta,
+        )
+
+        self.assertEqual(source_meta, meta.source_meta)
+
+    def test_chained_or(self):
+        result = GlobalIndexResult.create_empty()
+        for i in range(600):
+            other = GlobalIndexResult.from_range(Range(i * 10, i * 10 + 5))
+            result = result.or_(other)
+
+        self.assertEqual(result.results().cardinality(), 3600)
+
+    def test_chained_and(self):
+        result = GlobalIndexResult.from_range(Range(0, 10000))
+        for i in range(600):
+            other = GlobalIndexResult.from_range(Range(0, 10000))
+            result = result.and_(other)
+
+        self.assertEqual(result.results().cardinality(), 10001)
+
+
+class _CoverageOptions:
+    def __init__(self, mode):
+        self.options = Options({"global-index.search-mode": mode})
+
+    def scalar_index_search_mode(self):
+        return CoreOptions(self.options).scalar_index_search_mode()
+
+
+class _CoverageTable:
+    def __init__(self, mode, data_ranges=None):
+        self.options = _CoverageOptions(mode)
+        self.fields = [
+            DataField(0, "id", AtomicType("INT")),
+            DataField(1, "name", AtomicType("STRING")),
+        ]
+        self._data_ranges = data_ranges or []
+
+    def data_ranges_for_data_evolution_global_index_coverage(self, snapshot, partition_filter):
+        return self._data_ranges
+
+
+class _CoverageSnapshot:
+    def __init__(self, next_row_id):
+        self.next_row_id = next_row_id
+
+
+def _coverage_index_file(field_id, start, end, extra_field_ids=None):
+    return IndexFileMeta(
+        index_type="btree",
+        file_name="idx-%s-%s-%s" % (field_id, start, end),
+        file_size=1,
+        row_count=end - start + 1,
+        global_index_meta=GlobalIndexMeta(
+            row_range_start=start,
+            row_range_end=end,
+            index_field_id=field_id,
+            extra_field_ids=extra_field_ids,
+            index_meta=b"",
+        ),
+    )
+
+
+class DataEvolutionGlobalIndexCoverageTest(unittest.TestCase):
+
+    def test_fast_mode_does_not_return_unindexed_ranges(self):
+        from pypaimon.execution.python.globalindex.data_evolution_global_index_coverage import (
+            DataEvolutionGlobalIndexCoverage,
+        )
+
+        table = _CoverageTable(GlobalIndexSearchMode.FAST)
+        coverage = DataEvolutionGlobalIndexCoverage(
+            table,
+            _CoverageSnapshot(10),
+            None,
+            [_coverage_index_file(0, 0, 4)],
+        )
+
+        self.assertEqual([], coverage.unindexed_ranges(0))
+
+    def test_full_mode_uses_snapshot_next_row_id(self):
+        from pypaimon.execution.python.globalindex.data_evolution_global_index_coverage import (
+            DataEvolutionGlobalIndexCoverage,
+        )
+
+        table = _CoverageTable("full")
+        coverage = DataEvolutionGlobalIndexCoverage(
+            table,
+            _CoverageSnapshot(10),
+            None,
+            [_coverage_index_file(0, 0, 4)],
+        )
+
+        self.assertEqual([Range(5, 9)], coverage.unindexed_ranges(0))
+
+    def test_full_mode_accepts_multiple_field_ids(self):
+        from pypaimon.execution.python.globalindex.data_evolution_global_index_coverage import (
+            DataEvolutionGlobalIndexCoverage,
+        )
+
+        table = _CoverageTable("full")
+        coverage = DataEvolutionGlobalIndexCoverage(
+            table,
+            _CoverageSnapshot(10),
+            None,
+            [
+                _coverage_index_file(0, 0, 9),
+                _coverage_index_file(1, 0, 4),
+            ],
+        )
+
+        self.assertEqual([Range(5, 9)], coverage.unindexed_ranges([0, 1]))
+
+    def test_full_mode_intersects_coverage_for_all_predicate_fields(self):
+        from pypaimon.execution.python.globalindex.data_evolution_global_index_coverage import (
+            DataEvolutionGlobalIndexCoverage,
+        )
+
+        table = _CoverageTable("full")
+        coverage = DataEvolutionGlobalIndexCoverage(
+            table,
+            _CoverageSnapshot(10),
+            None,
+            [
+                _coverage_index_file(0, 0, 9),
+                _coverage_index_file(1, 0, 4),
+            ],
+        )
+        predicate = PredicateBuilder.and_predicates(
+            [
+                Predicate(method="equal", index=0, field="id", literals=[1]),
+                Predicate(method="equal", index=1, field="name", literals=["a"]),
+            ]
+        )
+
+        self.assertEqual(
+            [Range(5, 9)],
+            coverage.unindexed_ranges(table.fields, predicate),
+        )
+
+    def test_composite_fields_do_not_count_as_scalar_coverage(self):
+        from pypaimon.execution.python.globalindex.data_evolution_global_index_coverage import (
+            DataEvolutionGlobalIndexCoverage,
+        )
+
+        table = _CoverageTable("full")
+        coverage = DataEvolutionGlobalIndexCoverage(
+            table,
+            _CoverageSnapshot(10),
+            None,
+            [_coverage_index_file(0, 0, 9, extra_field_ids=[1])],
+        )
+
+        self.assertEqual([Range(0, 9)], coverage.unindexed_ranges(1))
+
+    def test_detail_mode_uses_table_data_ranges(self):
+        from pypaimon.execution.python.globalindex.data_evolution_global_index_coverage import (
+            DataEvolutionGlobalIndexCoverage,
+        )
+
+        table = _CoverageTable("detail", data_ranges=[Range(0, 2), Range(7, 9)])
+        coverage = DataEvolutionGlobalIndexCoverage(
+            table,
+            _CoverageSnapshot(10),
+            None,
+            [_coverage_index_file(0, 0, 4)],
+        )
+
+        self.assertEqual([Range(7, 9)], coverage.unindexed_ranges(0))
+
+
+class GlobalIndexScalarFallbackTest(unittest.TestCase):
+
+    @pytest.mark.python_plan
+    def test_full_fallback_groups_are_pruned_before_split_packing(self):
+        from pypaimon.execution.python.read.scanner.file_scanner import (_GlobalIndexPlanningResult)
+
+        with tempfile.TemporaryDirectory() as warehouse:
+            catalog = CatalogFactory.create({'warehouse': warehouse})
+            catalog.create_database('default', False)
+            schema = Schema.from_pyarrow_schema(
+                pa.schema([('key', pa.int64()), ('value', pa.string())]),
+                options={
+                    'data-evolution.enabled': 'true',
+                    'row-tracking.enabled': 'true',
+                    'metadata.stats-mode': 'full',
+                    'target-file-row-num': '10',
+                    'source.split.target-size': '1kb',
+                },
+            )
+            catalog.create_table('default.fallback_stats', schema, False)
+            table = catalog.get_table('default.fallback_stats')
+            for start in range(0, 100, 10):
+                write_builder = table.new_batch_write_builder()
+                writer = write_builder.new_write()
+                commit = write_builder.new_commit()
+                writer.write_arrow(pa.table({
+                    'key': list(range(start, start + 10)),
+                    'value': ['v{}'.format(i)
+                              for i in range(start, start + 10)],
+                }, schema=pa.schema([
+                    ('key', pa.int64()),
+                    ('value', pa.string()),
+                ])))
+                commit.commit(writer.prepare_commit())
+                writer.close()
+                commit.close()
+
+            read_builder = table.new_read_builder()
+            read_builder.with_filter(
+                read_builder.new_predicate_builder().equal('key', 5))
+            index_plan = (
+                _GlobalIndexPlanningResult(
+                    GlobalIndexResult.from_range(Range(5, 5)),
+                    [Range(10, 99)],
+                )
+            )
+
+            baseline_scan = read_builder.new_scan()
+            baseline_scanner = _python_scan_execution(baseline_scan)._file_scanner()
+            baseline_scanner._global_index_result = index_plan
+            baseline_scanner.predicate_for_stats = None
+            baseline_plan = baseline_scan.plan()
+
+            scan = read_builder.new_scan()
+            _python_scan_execution(scan)._file_scanner()._global_index_result = index_plan
+            plan = scan.plan()
+
+            stats_scan = read_builder.new_scan()
+            _python_scan_execution(stats_scan)._file_scanner()._global_index_result = index_plan
+            stats_plan, stats = stats_scan.scan_with_stats()
+
+            self.assertEqual(
+                10,
+                sum(len(split.files) for split in baseline_plan.splits()),
+            )
+            self.assertEqual(1, len(plan.splits()))
+            self.assertEqual(
+                1, sum(len(split.files) for split in plan.splits()))
+            self.assertEqual(10, stats.entries_after_bucket)
+            self.assertEqual(1, stats.entries_after_stats)
+            self.assertEqual(
+                1, sum(len(split.files) for split in stats_plan.splits()))
+            baseline_result = read_builder.new_read().to_arrow(
+                baseline_plan.splits()).to_pydict()
+            pruned_result = read_builder.new_read().to_arrow(
+                plan.splits()).to_pydict()
+            self.assertEqual(
+                {'key': [5], 'value': ['v5']},
+                baseline_result,
+            )
+            self.assertEqual(baseline_result, pruned_result)
+
+    def test_eval_global_index_keeps_unindexed_ranges_out_of_bitmap(self):
+        from pypaimon.execution.python.read.scanner.file_scanner import (FileScanner, _GlobalIndexPlanningResult)
+
+        class _Options:
+            def global_index_enabled(self):
+                return True
+
+            def scalar_index_search_mode(self):
+                return GlobalIndexSearchMode.FULL
+
+        class _Table:
+            options = _Options()
+            fields = [DataField(0, 'id', AtomicType('INT'))]
+
+        predicate = Predicate(method="equal", index=0, field="id", literals=[1])
+        scanner = FileScanner.__new__(FileScanner)
+        scanner.is_streaming = False
+        scanner.predicate = predicate
+        scanner.partition_key_predicate = None
+        scanner.table = _Table()
+
+        index_result = GlobalIndexResult.from_range(Range(1, 1))
+        unindexed = [Range(5, 6)]
+        fake_scanner = unittest.mock.MagicMock()
+        fake_scanner.scan_with_coverage.return_value = GlobalIndexEvaluation(
+            index_result, frozenset([0]))
+        fake_scanner.unindexed_ranges.return_value = unindexed
+        fake_scanner.__enter__.return_value = fake_scanner
+        fake_scanner.__exit__.return_value = None
+
+        with unittest.mock.patch(
+                "pypaimon.execution.python.globalindex.data_evolution_global_index_scanner."
+                "DataEvolutionGlobalIndexScanner.create",
+                return_value=fake_scanner), unittest.mock.patch.object(
+                    GlobalIndexResult,
+                    "from_ranges",
+                    side_effect=AssertionError("fallback ranges entered bitmap")):
+            result = scanner._eval_global_index(snapshot=object())
+
+        self.assertIsInstance(result, _GlobalIndexPlanningResult)
+        self.assertIs(index_result, result.indexed_result)
+        self.assertEqual(unindexed, result.unindexed_ranges)
+        fake_scanner.unindexed_ranges.assert_called_once_with(
+            predicate,
+            search_mode=GlobalIndexSearchMode.FULL,
+            contributing_field_ids=frozenset([0]),
+        )
+
+    def test_split_planning_merges_indexed_and_unindexed_ranges(self):
+        from pypaimon.execution.python.read.scanner.file_scanner import (FileScanner, _GlobalIndexPlanningResult)
+
+        scanner = FileScanner.__new__(FileScanner)
+        scanner.idx_of_this_subtask = None
+        scanner.start_pos_of_this_subtask = None
+        scanner.manifest_scanner = unittest.mock.MagicMock(
+            return_value=([], unittest.mock.Mock(id=3)))
+        scanner._global_index_result = None
+        scanner._eval_global_index = unittest.mock.MagicMock(
+            return_value=_GlobalIndexPlanningResult(
+                GlobalIndexResult.from_range(Range(1, 1)),
+                [Range(10, 10 ** 12)],
+            ))
+        scanner.predicate = Predicate(
+            method="equal", index=0, field="id", literals=[1])
+        scanner.read_manifest_entries = unittest.mock.MagicMock(return_value=[])
+        scanner.table = unittest.mock.Mock()
+        scanner.target_split_size = 1
+        scanner.open_file_cost = 1
+        scanner._deletion_files_map = unittest.mock.MagicMock(return_value={})
+
+        for query_auth in (False, True):
+            with self.subTest(query_auth=query_auth):
+                scanner.table.options = CoreOptions(Options({
+                    "query-auth.enabled": str(query_auth).lower(),
+                }))
+                scanner._eval_global_index.reset_mock()
+                with unittest.mock.patch(
+                        "pypaimon.execution.python.read.scanner.file_scanner.DataEvolutionSplitGenerator"
+                ) as split_generator:
+                    scanner._create_data_evolution_split_generator()
+
+                self.assertEqual(
+                    None if query_auth else [Range(1, 1), Range(10, 10 ** 12)],
+                    split_generator.call_args[0][4],
+                )
+                if query_auth:
+                    scanner._eval_global_index.assert_not_called()
+                else:
+                    scanner._eval_global_index.assert_called_once_with(
+                        scanner.manifest_scanner.return_value[1])
+
+    def test_eval_global_index_keeps_none_as_full_scan(self):
+        from pypaimon.execution.python.read.scanner.file_scanner import (FileScanner)
+
+        class _Options:
+            def global_index_enabled(self):
+                return True
+
+        class _Table:
+            options = _Options()
+            fields = [DataField(0, 'id', AtomicType('INT'))]
+
+        scanner = FileScanner.__new__(FileScanner)
+        scanner.is_streaming = False
+        scanner.predicate = Predicate(
+            method="equal", index=0, field="id", literals=[1])
+        scanner.partition_key_predicate = None
+        scanner.table = _Table()
+
+        fake_scanner = unittest.mock.MagicMock()
+        fake_scanner.scan_with_coverage.return_value = None
+        fake_scanner.__enter__.return_value = fake_scanner
+        fake_scanner.__exit__.return_value = None
+
+        with unittest.mock.patch(
+                "pypaimon.execution.python.globalindex.data_evolution_global_index_scanner."
+                "DataEvolutionGlobalIndexScanner.create",
+                return_value=fake_scanner):
+            result = scanner._eval_global_index(snapshot=object())
+
+        self.assertIsNone(result)
+        fake_scanner.scan_with_coverage.assert_called_once_with(scanner.predicate)
+
+
+class PlanSnapshotFetchRegressionTest(
+        BatchModeMixin, DataEvolutionTestBase, unittest.TestCase):
+
+    table_options = {
+        'row-tracking.enabled': 'true',
+        'data-evolution.enabled': 'true',
+        'global-index.enabled': 'true',
+        'bucket': '-1',
+    }
+
+    @pytest.mark.python_plan
+    def test_plan_accepts_row_ranges_without_bitmap(self):
+        table = self._create_table()
+        self._write_arrow(table, pa.table(
+            {'id': [1, 2, 3], 'name': ['a', 'b', 'c'],
+             'age': [10, 20, 30], 'city': ['x', 'y', 'z']},
+            schema=self.pa_schema))
+
+        read_builder = table.new_read_builder()
+        ranges = [Range(0, 10 ** 12)]
+        with patch.object(
+                RoaringBitmap64,
+                'to_range_list',
+                side_effect=AssertionError('row ranges entered a bitmap')):
+            plan = read_builder.new_scan().with_row_ranges(ranges).plan()
+
+        result = read_builder.new_read().to_arrow(plan.splits())
+        self.assertEqual([1, 2, 3], sorted(result.column('id').to_pylist()))
+        self.assertEqual(
+            [], read_builder.new_scan().with_row_ranges([]).plan().splits())
+
+    @pytest.mark.python_plan
+    def test_plan_fetches_latest_snapshot_only_once(self):
+        table = self._create_table()
+        self._write_arrow(table, pa.table(
+            {'id': [1, 2, 3], 'name': ['a', 'b', 'c'],
+             'age': [10, 20, 30], 'city': ['x', 'y', 'z']},
+            schema=self.pa_schema))
+
+        fresh_table = self.catalog.get_table(table.identifier.get_full_name())
+        rb = fresh_table.new_read_builder()
+        rb = rb.with_filter(rb.new_predicate_builder().equal('id', 1))
+
+        orig_get_latest = SnapshotManager.get_latest_snapshot
+        call_count = [0]
+
+        def counting(self_sm, *args, **kwargs):
+            call_count[0] += 1
+            return orig_get_latest(self_sm, *args, **kwargs)
+
+        with patch.object(SnapshotManager, 'get_latest_snapshot', counting):
+            rb.new_scan().plan().splits()
+
+        self.assertEqual(
+            1, call_count[0],
+            msg=f"Plan fetched latest snapshot {call_count[0]} times — "
+                "duplicate from #7513: manifest_scanner + "
+                "DataEvolutionGlobalIndexScanner.create both fetch independently.")
+
+    @pytest.mark.python_plan
+    def test_time_travel_plan(self):
+        table = self._create_table()
+        self._write_arrow(table, pa.table(
+            {'id': [1], 'name': ['a'], 'age': [10], 'city': ['x']},
+            schema=self.pa_schema))
+        snapshot_1_id = table.snapshot_manager().get_latest_snapshot().id
+        self._write_arrow(table, pa.table(
+            {'id': [2], 'name': ['b'], 'age': [20], 'city': ['y']},
+            schema=self.pa_schema))
+
+        travel_table = self.catalog.get_table(
+            table.identifier.get_full_name()
+        ).copy({'scan.snapshot-id': str(snapshot_1_id)})
+        rb = travel_table.new_read_builder()
+        rb = rb.with_filter(rb.new_predicate_builder().equal('id', 1))
+
+        orig_scan = IndexFileHandler.scan
+        seen_snapshot_ids = []
+
+        def spy_scan(self_h, snapshot, entry_filter=None):
+            seen_snapshot_ids.append(snapshot.id if snapshot else None)
+            return orig_scan(self_h, snapshot, entry_filter)
+
+        with patch.object(IndexFileHandler, 'scan', spy_scan):
+            rb.new_scan().plan().splits()
+
+        self.assertTrue(seen_snapshot_ids,
+                        "IndexFileHandler.scan was never called")
+        self.assertEqual(
+            snapshot_1_id, seen_snapshot_ids[0],
+            msg=f"Global index evaluated against snapshot "
+                f"{seen_snapshot_ids[0]}, expected time-travel snapshot "
+                f"{snapshot_1_id}. Before #7513 was fixed, "
+                "DataEvolutionGlobalIndexScanner.create self-fetched latest snapshot, "
+                "so global index used latest while manifest used the "
+                "time-travel snapshot — silent correctness bug.")

@@ -1,0 +1,252 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.fileindex;
+
+import org.apache.paimon.fileindex.bitmap.BitmapIndexResult;
+import org.apache.paimon.fs.ByteArraySeekableStream;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.SeekableInputStream;
+import org.apache.paimon.predicate.ArraysOverlap;
+import org.apache.paimon.predicate.CompoundPredicate;
+import org.apache.paimon.predicate.FieldRef;
+import org.apache.paimon.predicate.In;
+import org.apache.paimon.predicate.LeafFunction;
+import org.apache.paimon.predicate.LeafPredicate;
+import org.apache.paimon.predicate.Or;
+import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.predicate.PredicateVisitor;
+import org.apache.paimon.predicate.SortValue;
+import org.apache.paimon.predicate.TopN;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.IOUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
+
+import java.io.Closeable;
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+
+import static java.util.stream.Collectors.toList;
+import static org.apache.paimon.fileindex.FileIndexResult.REMAIN;
+import static org.apache.paimon.fileindex.FileIndexResult.SKIP;
+
+/** Utils to check secondary index (e.g. bloom filter) predicate. */
+public class FileIndexPredicate implements Closeable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(FileIndexPredicate.class);
+
+    private final FileIndexFormat.Reader reader;
+
+    @Nullable private Path path;
+
+    public FileIndexPredicate(Path path, FileIO fileIO, RowType fileRowType) throws IOException {
+        this.reader = createReader(path, fileIO, fileRowType);
+        this.path = path;
+    }
+
+    public FileIndexPredicate(byte[] serializedBytes, RowType fileRowType) {
+        this(new ByteArraySeekableStream(serializedBytes), fileRowType, serializedBytes.length);
+    }
+
+    /**
+     * @deprecated Use {@link #FileIndexPredicate(SeekableInputStream, RowType, long)} for V2
+     *     containers.
+     */
+    @Deprecated
+    public FileIndexPredicate(SeekableInputStream inputStream, RowType fileRowType) {
+        this.reader = FileIndexFormat.createReader(inputStream, fileRowType);
+    }
+
+    public FileIndexPredicate(
+            SeekableInputStream inputStream, RowType fileRowType, long containerLength) {
+        // createReader itself closes the stream when container validation fails, so
+        // there is no stream to release here anymore.
+        this.reader = FileIndexFormat.createReader(inputStream, fileRowType, containerLength);
+    }
+
+    private static FileIndexFormat.Reader createReader(
+            Path path, FileIO fileIO, RowType fileRowType) throws IOException {
+        SeekableInputStream inputStream = fileIO.newInputStream(path);
+        int version;
+        try {
+            version = FileIndexFormatUtils.readVersion(new DataInputStream(inputStream));
+        } catch (IOException | RuntimeException e) {
+            IOUtils.closeQuietly(inputStream);
+            throw new RuntimeException("Exception happens while construct file index reader.", e);
+        }
+
+        long length = -1;
+        if (version == FileIndexFormatUtils.VERSION_2) {
+            try {
+                length = fileIO.getFileStatus(path).getLen();
+            } catch (IOException | RuntimeException e) {
+                IOUtils.closeQuietly(inputStream);
+                throw e;
+            }
+        }
+        return FileIndexFormat.createReaderAfterVersion(inputStream, fileRowType, length, version);
+    }
+
+    public FileIndexResult evaluate(@Nullable Predicate predicate) {
+        return evaluate(predicate, false);
+    }
+
+    public FileIndexResult evaluate(@Nullable Predicate predicate, boolean ignoreUnknownType) {
+        if (predicate == null) {
+            return REMAIN;
+        }
+        Set<String> requiredFieldNames = getRequiredNames(predicate);
+        Map<String, Collection<FileIndexReader>> indexReaders = new HashMap<>();
+        requiredFieldNames.forEach(
+                name -> indexReaders.put(name, reader.readColumnIndex(name, ignoreUnknownType)));
+        FileIndexResult result = new FileIndexPredicateTest(indexReaders).test(predicate);
+        if (!result.remain()) {
+            LOG.debug(
+                    "One file has been filtered: "
+                            + (path == null ? "in scan stage" : path.toString()));
+        }
+        return result;
+    }
+
+    public FileIndexResult evaluateTopN(@Nullable TopN topN, FileIndexResult result) {
+        return evaluateTopN(topN, result, false);
+    }
+
+    public FileIndexResult evaluateTopN(
+            @Nullable TopN topN, FileIndexResult result, boolean ignoreUnknownType) {
+        if (topN == null || !result.remain()) {
+            return result;
+        }
+
+        int k = topN.limit();
+        if (result instanceof BitmapIndexResult) {
+            long cardinality = ((BitmapIndexResult) result).get().getCardinality();
+            if (cardinality <= k) {
+                return result;
+            }
+        }
+
+        List<SortValue> orders = topN.orders();
+        String requiredName = orders.get(0).field().name();
+        Set<FileIndexReader> readers = reader.readColumnIndex(requiredName, ignoreUnknownType);
+        for (FileIndexReader reader : readers) {
+            FileIndexResult ret = reader.visitTopN(topN, result);
+            if (!REMAIN.equals(ret)) {
+                ret.remain();
+                return ret;
+            }
+        }
+        return result;
+    }
+
+    private Set<String> getRequiredNames(Predicate filePredicate) {
+        return PredicateVisitor.collectFieldNames(filePredicate);
+    }
+
+    @Override
+    public void close() throws IOException {
+        this.reader.close();
+    }
+
+    /** Predicate test worker. */
+    private static class FileIndexPredicateTest implements PredicateVisitor<FileIndexResult> {
+
+        private final Map<String, Collection<FileIndexReader>> columnIndexReaders;
+
+        public FileIndexPredicateTest(Map<String, Collection<FileIndexReader>> fileIndexReaders) {
+            this.columnIndexReaders = fileIndexReaders;
+        }
+
+        public FileIndexResult test(Predicate predicate) {
+            return predicate.visit(this);
+        }
+
+        @Override
+        public FileIndexResult visit(LeafPredicate predicate) {
+            Optional<FieldRef> fieldRefOptional = predicate.fieldRefOptional();
+            if (!fieldRefOptional.isPresent()) {
+                return REMAIN;
+            }
+
+            LeafFunction function = predicate.function();
+            List<Object> literals = predicate.literals();
+            if (literals.stream().anyMatch(Objects::isNull)) {
+                // Index readers do not expect a null literal. A null literal never matches a
+                // row: IN and ARRAYS_OVERLAP ignore it, and every other function is false on it.
+                if (function instanceof In || function instanceof ArraysOverlap) {
+                    literals = literals.stream().filter(Objects::nonNull).collect(toList());
+                    if (literals.isEmpty()) {
+                        return SKIP;
+                    }
+                } else {
+                    return SKIP;
+                }
+            }
+            FileIndexResult compoundResult = REMAIN;
+            FieldRef fieldRef = fieldRefOptional.get();
+            for (FileIndexReader fileIndexReader : columnIndexReaders.get(fieldRef.name())) {
+                compoundResult =
+                        compoundResult.and(function.visit(fileIndexReader, fieldRef, literals));
+
+                if (!compoundResult.remain()) {
+                    return compoundResult;
+                }
+            }
+            return compoundResult;
+        }
+
+        @Override
+        public FileIndexResult visit(CompoundPredicate predicate) {
+            if (predicate.function() instanceof Or) {
+                FileIndexResult compoundResult = null;
+                for (Predicate predicate1 : predicate.children()) {
+                    compoundResult =
+                            compoundResult == null
+                                    ? predicate1.visit(this)
+                                    : compoundResult.or(predicate1.visit(this));
+                }
+                return compoundResult == null ? REMAIN : compoundResult;
+            } else {
+                FileIndexResult compoundResult = null;
+                for (Predicate predicate1 : predicate.children()) {
+                    compoundResult =
+                            compoundResult == null
+                                    ? predicate1.visit(this)
+                                    : compoundResult.and(predicate1.visit(this));
+                    // if not remain, no need to test anymore
+                    if (!compoundResult.remain()) {
+                        return compoundResult;
+                    }
+                }
+                return compoundResult == null ? REMAIN : compoundResult;
+            }
+        }
+    }
+}

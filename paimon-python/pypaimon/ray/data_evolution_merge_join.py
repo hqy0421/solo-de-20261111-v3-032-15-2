@@ -1,0 +1,1027 @@
+################################################################################
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import pyarrow as pa
+
+from pypaimon.write.merge_transform import (
+    SourceColumnRef,
+    _NormalizedClause,
+    build_delete_schema,
+    build_update_schema,
+)
+from pypaimon.ray.partitioning import (
+    _default_hash_shuffle_parallelism,
+    _resolve_num_partitions,
+    _resolve_row_id_num_partitions,
+)
+
+
+def _map_kwargs(
+    ray_remote_args: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build kwargs for map_batches/map_groups; spread ray_remote_args because
+    those APIs take remote options as **kwargs, not under a 'ray_remote_args'
+    key."""
+    kwargs: Dict[str, Any] = {"batch_format": "pyarrow"}
+    if ray_remote_args:
+        kwargs.update(ray_remote_args)
+    return kwargs
+
+
+def _resolve_matched_num_partitions(
+    num_partitions: Optional[int],
+    estimated_size_bytes: Optional[int],
+    target_ds,
+) -> int:
+    """Resolve a target-left join from the context sealed on its left input."""
+    if num_partitions is not None:
+        return num_partitions
+
+    data_context = getattr(target_ds, "context", None)
+    default_shuffle = _default_hash_shuffle_parallelism(data_context)
+    return _resolve_num_partitions(
+        num_partitions,
+        estimated_size_bytes,
+        min_partitions=default_shuffle,
+        unknown_num_partitions=default_shuffle,
+        data_context=data_context,
+    )
+
+
+@dataclass(frozen=True)
+class _SelfMergeUpdatePlan:
+    """Pinned target file groups for self-merge update execution."""
+
+    table: Any
+    scan_table: Any
+    file_groups: list
+    predicate: Any
+    read_type: list
+    clauses: List[_NormalizedClause]
+    update_cols: List[str]
+    update_schema: pa.Schema
+    row_id_name: str
+    snapshot_id: int
+    callable_input_columns: Optional[List[str]]
+    row_id_plan: Any
+    native_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class _SelfMergeUpdateContext:
+    """Worker state shared by all file groups."""
+
+    table: Any
+    scan_table: Any
+    predicate: Any
+    read_type: list
+    clauses: List[_NormalizedClause]
+    update_cols: List[str]
+    update_schema: pa.Schema
+    row_id_name: str
+    snapshot_id: int
+    callable_input_columns: Optional[List[str]]
+    native_enabled: bool = False
+
+
+def _resolve_source_projection(
+    clauses: List[_NormalizedClause],
+    source_on: Sequence[str],
+    source_field_names: Sequence[str],
+) -> list:
+    needed = set(source_on)
+    source_set = set(source_field_names)
+
+    for clause in clauses:
+        for value in clause.spec.values():
+            if callable(value) and not isinstance(value, type):
+                needed.update(source_field_names)
+            if isinstance(value, SourceColumnRef):
+                needed.add(value.column)
+        if clause.condition is not None:
+            from pypaimon.write.merge_condition import extract_columns
+            for ref in extract_columns(clause.condition):
+                prefix, col = ref.split(".", 1)
+                if prefix == "s" and col in source_set:
+                    needed.add(col)
+
+    return [c for c in source_field_names if c in needed]
+
+
+def _build_matched_transform(
+    clauses: List[_NormalizedClause],
+    on_map: Dict[str, str],
+    on_pairs: List[Tuple[str, str]],
+    update_cols: List[str],
+    row_id_name: str,
+    update_schema: pa.Schema,
+    callable_input_columns: Optional[Sequence[str]] = None,
+    native_enabled: bool = False,
+):
+    from pypaimon.write.backend_dispatch import create_merge_batch_transform
+    return create_merge_batch_transform(
+        'update', clauses, on_map, on_pairs, update_cols, row_id_name,
+        update_schema, callable_input_columns, native_enabled=native_enabled,
+    )
+
+
+def _build_matched_delete_transform(
+    clauses: List[_NormalizedClause],
+    on_map: Dict[str, str],
+    row_id_name: str,
+    delete_schema: pa.Schema,
+    native_enabled: bool = False,
+):
+    from pypaimon.write.backend_dispatch import create_merge_batch_transform
+    return create_merge_batch_transform(
+        'delete', clauses, on_map, row_id_name, delete_schema,
+        native_enabled=native_enabled,
+    )
+
+
+def build_self_merge_update_plan(
+    *,
+    table,
+    clauses: List[_NormalizedClause],
+    target_field_names: Sequence[str],
+    target_pa_schema: pa.Schema,
+    update_cols: Sequence[str],
+    resolve_target_projection,
+    snapshot_id: Optional[int] = None,
+    scan_predicate=None,
+    read_columns: Sequence[str] = (),
+    native_enabled: bool = False,
+) -> _SelfMergeUpdatePlan:
+    from pypaimon.common.options.core_options import (
+        CoreOptions, GlobalIndexSearchMode,
+    )
+    from pypaimon.table.special_fields import SpecialFields
+    from pypaimon.write.row_id_plan import capture_row_id_plan
+
+    row_id_name = SpecialFields.ROW_ID.name
+    needed_cols = set(resolve_target_projection(
+        clauses, [row_id_name], update_cols, target_field_names,
+        callable_columns=read_columns or None,
+    ))
+    needed_cols.update(read_columns)
+    for clause in clauses:
+        for value in clause.spec.values():
+            if isinstance(value, SourceColumnRef):
+                needed_cols.add(value.column)
+    target_set = set(target_field_names)
+    for clause in clauses:
+        if clause.condition is not None:
+            from pypaimon.write.merge_condition import extract_columns
+            for ref in extract_columns(clause.condition):
+                prefix, col = ref.split(".", 1)
+                if prefix == "s" and col in target_set:
+                    needed_cols.add(col)
+    projection = [row_id_name] + [
+        c for c in target_field_names if c in needed_cols
+    ]
+
+    dynamic_options = {}
+    if snapshot_id is not None:
+        dynamic_options[CoreOptions.SCAN_SNAPSHOT_ID.key()] = str(snapshot_id)
+    if scan_predicate is not None:
+        dynamic_options[CoreOptions.SCALAR_INDEX_SEARCH_MODE.key()] = (
+            GlobalIndexSearchMode.FULL.value
+        )
+    scan_table = (
+        table.copy_without_time_travel(dynamic_options)
+        if dynamic_options else table
+    )
+    from pypaimon.snapshot.time_travel_util import TimeTravelUtil
+    scan_table = scan_table._copy_with_snapshot(TimeTravelUtil.resolve_snapshot(scan_table))
+    read_builder = scan_table.new_read_builder().with_projection(projection)
+    if scan_predicate is not None:
+        read_builder.with_filter(scan_predicate)
+    scan_plan = read_builder.new_scan().plan_all()
+    planned_snapshot_id = (
+        scan_plan.snapshot_id
+        if scan_plan.snapshot_id is not None else -1
+    )
+    # A packed scan split may contain multiple logical row-id groups. Keep
+    # each group intact, but do not materialize unrelated groups together.
+    row_id_plan = capture_row_id_plan(scan_table, scan_plan)
+    file_groups = [split for _, _, split in row_id_plan.groups]
+    update_schema = build_update_schema(target_pa_schema, update_cols, row_id_name)
+    return _SelfMergeUpdatePlan(
+        table=table,
+        scan_table=scan_table,
+        file_groups=file_groups,
+        predicate=scan_predicate,
+        read_type=read_builder.read_type(),
+        clauses=clauses,
+        update_cols=list(update_cols),
+        update_schema=update_schema,
+        row_id_name=row_id_name,
+        snapshot_id=planned_snapshot_id,
+        callable_input_columns=(
+            list(read_columns) + [row_id_name]
+            if read_columns else None
+        ),
+        row_id_plan=row_id_plan,
+        native_enabled=native_enabled,
+    )
+
+
+def _self_merge_aliases(batch: pa.Table, row_id_name: str) -> pa.Table:
+    columns = []
+    names = []
+    for name, column in zip(batch.schema.names, batch.columns):
+        columns.append(column)
+        names.append(f"t.{name}")
+        if name != row_id_name:
+            columns.append(column)
+            names.append(f"s.{name}")
+    return pa.table(columns, names=names)
+
+
+def _apply_self_merge_update_group(context, group_plan, collect_row_ids):
+    """Read, transform, and stage one complete first-row-id file group."""
+    from pypaimon.read.table_read import TableRead
+
+    file_group = group_plan.plan.splits()[0]
+    table_read = TableRead(
+        context.scan_table,
+        context.predicate,
+        context.read_type,
+    )
+    transform = _build_matched_transform(
+        context.clauses,
+        on_map={context.row_id_name: context.row_id_name},
+        on_pairs=[(context.row_id_name, context.row_id_name)],
+        update_cols=context.update_cols,
+        row_id_name=context.row_id_name,
+        update_schema=context.update_schema,
+        callable_input_columns=context.callable_input_columns,
+        native_enabled=context.native_enabled,
+    )
+    update_parts = []
+    batch_reader = table_read.to_arrow_batch_reader([file_group])
+    for batch in iter(batch_reader.read_next_batch, None):
+        if batch.num_rows == 0:
+            continue
+        matched = pa.Table.from_batches([batch])
+        updates = transform(_self_merge_aliases(
+            matched, context.row_id_name,
+        ))
+        if updates.num_rows > 0:
+            update_parts.append(updates)
+
+    if not update_parts:
+        return [], 0, []
+    updates = (
+        update_parts[0]
+        if len(update_parts) == 1 else pa.concat_tables(update_parts)
+    )
+
+    row_ids = (
+        updates.column(context.row_id_name).to_pylist()
+        if collect_row_ids else []
+    )
+
+    updater = context.table.new_batch_write_builder().new_update().new_update_by_row_id(
+        _precomputed_files_info=group_plan)
+    try:
+        messages = updater.update_columns(updates, context.update_cols)
+    except Exception:
+        # Never delete files from CommitMessage on failure.
+        # A commit can succeed even when its response raises an exception.
+        raise
+    return messages, updates.num_rows, row_ids
+
+
+def distributed_self_merge_update_apply(
+    plan: _SelfMergeUpdatePlan,
+    *,
+    num_partitions: int,
+    ray_remote_args: Optional[Dict[str, Any]] = None,
+    collect_row_ids: bool = False,
+) -> Tuple[list, int, list]:
+    """Stage self-merge updates in scan tasks without a routing shuffle."""
+    import ray
+    from pypaimon.read.plan import Plan
+    from pypaimon.write.row_id_plan import CapturedRowIdPlan
+
+    captured = plan.row_id_plan
+    if not captured.groups:
+        return [], 0, []
+
+    remote_args = dict(ray_remote_args or {})
+    apply_remote = (
+        ray.remote(**remote_args)(_apply_self_merge_update_group)
+        if remote_args else ray.remote(_apply_self_merge_update_group)
+    )
+    context = ray.put(_SelfMergeUpdateContext(
+        table=plan.table,
+        scan_table=plan.scan_table,
+        predicate=plan.predicate,
+        read_type=plan.read_type,
+        clauses=plan.clauses,
+        update_cols=plan.update_cols,
+        update_schema=plan.update_schema,
+        row_id_name=plan.row_id_name,
+        snapshot_id=plan.snapshot_id,
+        callable_input_columns=plan.callable_input_columns,
+        native_enabled=plan.native_enabled,
+    ))
+    group_iter = iter(captured.groups)
+    max_in_flight = max(1, min(num_partitions, len(captured.groups)))
+    pending = set()
+    messages = []
+    num_updated = 0
+    row_ids = []
+    first_error = None
+
+    def submit_next():
+        try:
+            group = next(group_iter)
+        except StopIteration:
+            return False
+        # Transport only this canonical group. Ray deserializes shared Python
+        # objects per task, so broadcasting the full plan repeats all metadata.
+        group_plan = CapturedRowIdPlan(
+            captured.table, Plan([group[2]], captured.plan.snapshot_id), [group])
+        pending.add(apply_remote.remote(
+            context, group_plan, collect_row_ids
+        ))
+        return True
+
+    for _ in range(max_in_flight):
+        submit_next()
+
+    while pending:
+        ready, remaining = ray.wait(list(pending), num_returns=1)
+        pending = set(remaining)
+        ref = ready[0]
+        try:
+            split_messages, split_count, split_row_ids = ray.get(ref)
+            messages.extend(split_messages)
+            num_updated += split_count
+            row_ids.extend(split_row_ids)
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+        if first_error is None:
+            submit_next()
+
+    if first_error is not None:
+        # Never delete files from CommitMessage on failure.
+        # A commit can succeed even when its response raises an exception.
+        raise first_error
+    return messages, num_updated, row_ids
+
+
+def build_self_merge_delete_ds(
+    *,
+    target_identifier: str,
+    clauses: List[_NormalizedClause],
+    target_field_names: Sequence[str],
+    catalog_options: Dict[str, str],
+    resolve_target_projection,
+    snapshot_id: Optional[int] = None,
+    scan_predicate=None,
+    ray_remote_args: Optional[Dict[str, Any]] = None,
+    native_enabled: bool = False,
+) -> Tuple:
+    from pypaimon.ray.ray_paimon import read_paimon
+    from pypaimon.table.special_fields import SpecialFields
+
+    row_id_name = SpecialFields.ROW_ID.name
+    needed_cols = set(resolve_target_projection(
+        clauses, [row_id_name], [], target_field_names,
+    ))
+    target_set = set(target_field_names)
+    for clause in clauses:
+        if clause.condition is not None:
+            from pypaimon.write.merge_condition import extract_columns
+            for ref in extract_columns(clause.condition):
+                prefix, col = ref.split(".", 1)
+                if prefix == "s" and col in target_set:
+                    needed_cols.add(col)
+    projection = [row_id_name] + [
+        c for c in target_field_names if c in needed_cols
+    ]
+
+    read_kwargs = {}
+    if scan_predicate is not None:
+        from pypaimon.common.options.core_options import (
+            CoreOptions, GlobalIndexSearchMode,
+        )
+        read_kwargs["filter"] = scan_predicate
+        read_kwargs["dynamic_options"] = {
+            CoreOptions.SCALAR_INDEX_SEARCH_MODE.key():
+                GlobalIndexSearchMode.FULL.value,
+        }
+    target_ds = read_paimon(
+        target_identifier, catalog_options,
+        projection=projection, snapshot_id=snapshot_id,
+        _preserve_current_schema=True,
+        **read_kwargs,
+    )
+    delete_schema = build_delete_schema(row_id_name)
+
+    orig_names = target_ds.schema().names
+    target_renamed = target_ds.rename_columns(
+        {c: f"t.{c}" for c in orig_names}
+    )
+
+    def _add_source_aliases(batch: pa.Table) -> pa.Table:
+        columns = list(batch.columns)
+        names = list(batch.schema.names)
+        for orig in orig_names:
+            if orig == row_id_name:
+                continue
+            t_col_name = f"t.{orig}"
+            if t_col_name in names:
+                idx = names.index(t_col_name)
+                columns.append(columns[idx])
+                names.append(f"s.{orig}")
+        return pa.table(columns, names=names)
+
+    aliased = target_renamed.map_batches(
+        _add_source_aliases, **_map_kwargs(ray_remote_args),
+    )
+
+    _transform = _build_matched_delete_transform(
+        clauses,
+        on_map={row_id_name: row_id_name},
+        row_id_name=row_id_name,
+        delete_schema=delete_schema,
+        native_enabled=native_enabled,
+    )
+    return aliased.map_batches(_transform, **_map_kwargs(ray_remote_args))
+
+
+def build_matched_update_ds(
+    *,
+    target_identifier: str,
+    source_ds,
+    target_on: Sequence[str],
+    source_on: Sequence[str],
+    clauses: List[_NormalizedClause],
+    target_field_names: Sequence[str],
+    target_pa_schema: pa.Schema,
+    update_cols: Sequence[str],
+    catalog_options: Dict[str, str],
+    num_partitions: Optional[int],
+    resolve_target_projection,
+    estimated_size_bytes: Optional[int] = None,
+    snapshot_id: Optional[int] = None,
+    ray_remote_args: Optional[Dict[str, Any]] = None,
+    native_enabled: bool = False,
+) -> Tuple:
+    from pypaimon.ray.ray_paimon import read_paimon
+    from pypaimon.table.special_fields import SpecialFields
+
+    row_id_name = SpecialFields.ROW_ID.name
+    needed_cols = resolve_target_projection(
+        clauses, target_on, update_cols, target_field_names,
+    )
+    projection = [row_id_name] + [c for c in needed_cols if c != row_id_name]
+
+    target_ds = read_paimon(
+        target_identifier, catalog_options,
+        projection=projection, snapshot_id=snapshot_id,
+    )
+    update_schema = build_update_schema(target_pa_schema, update_cols, row_id_name)
+
+    target_renamed = target_ds.rename_columns(
+        {c: f"t.{c}" for c in target_ds.schema().names}
+    )
+    num_partitions = _resolve_matched_num_partitions(
+        num_partitions, estimated_size_bytes, target_renamed,
+    )
+    source_cols = _resolve_source_projection(
+        clauses, source_on, source_ds.schema().names,
+    )
+    source_ds = source_ds.select_columns(source_cols)
+    source_renamed = source_ds.rename_columns(
+        {c: f"s.{c}" for c in source_cols}
+    )
+
+    joined = target_renamed.join(
+        source_renamed,
+        join_type="inner",
+        num_partitions=num_partitions,
+        on=tuple(f"t.{c}" for c in target_on),
+        right_on=tuple(f"s.{c}" for c in source_on),
+    )
+
+    _transform = _build_matched_transform(
+        clauses,
+        on_map=dict(zip(source_on, target_on)),
+        on_pairs=list(zip(source_on, target_on)),
+        update_cols=list(update_cols),
+        row_id_name=row_id_name,
+        update_schema=update_schema,
+        native_enabled=native_enabled,
+    )
+    return joined.map_batches(_transform, **_map_kwargs(ray_remote_args))
+
+
+def build_matched_delete_ds(
+    *,
+    target_identifier: str,
+    source_ds,
+    target_on: Sequence[str],
+    source_on: Sequence[str],
+    clauses: List[_NormalizedClause],
+    target_field_names: Sequence[str],
+    catalog_options: Dict[str, str],
+    num_partitions: Optional[int],
+    resolve_target_projection,
+    estimated_size_bytes: Optional[int] = None,
+    snapshot_id: Optional[int] = None,
+    ray_remote_args: Optional[Dict[str, Any]] = None,
+    native_enabled: bool = False,
+) -> Tuple:
+    from pypaimon.ray.ray_paimon import read_paimon
+    from pypaimon.table.special_fields import SpecialFields
+
+    row_id_name = SpecialFields.ROW_ID.name
+    needed_cols = resolve_target_projection(
+        clauses,
+        target_on,
+        [],
+        target_field_names,
+    )
+    projection = [row_id_name] + [c for c in needed_cols if c != row_id_name]
+
+    target_ds = read_paimon(
+        target_identifier, catalog_options,
+        projection=projection, snapshot_id=snapshot_id,
+    )
+    delete_schema = build_delete_schema(row_id_name)
+
+    target_renamed = target_ds.rename_columns(
+        {c: f"t.{c}" for c in target_ds.schema().names}
+    )
+    num_partitions = _resolve_matched_num_partitions(
+        num_partitions, estimated_size_bytes, target_renamed,
+    )
+    source_cols = list(source_ds.schema().names)
+    source_renamed = source_ds.rename_columns(
+        {c: f"s.{c}" for c in source_cols}
+    )
+
+    joined = target_renamed.join(
+        source_renamed,
+        join_type="inner",
+        num_partitions=num_partitions,
+        on=tuple(f"t.{c}" for c in target_on),
+        right_on=tuple(f"s.{c}" for c in source_on),
+    )
+
+    _transform = _build_matched_delete_transform(
+        clauses,
+        on_map=dict(zip(source_on, target_on)),
+        row_id_name=row_id_name,
+        delete_schema=delete_schema,
+        native_enabled=native_enabled,
+    )
+    return joined.map_batches(_transform, **_map_kwargs(ray_remote_args))
+
+
+def distributed_update_apply(
+    update_ds,
+    table,
+    write_update_cols: Sequence[str],
+    *,
+    num_partitions: Optional[int],
+    ray_remote_args: Optional[Dict[str, Any]] = None,
+    base_snapshot_id: Optional[int] = None,
+    collect_row_ids: bool = False,
+    estimated_size_bytes: Optional[int] = None,
+    estimated_num_rows: Optional[int] = None,
+    data_context=None,
+    materialize_before_routing: bool = False,
+    scan_plan=None,
+) -> Tuple[list, int, list]:
+    import pickle
+
+    import pyarrow.compute as pc
+    import ray
+
+    from pypaimon.table.special_fields import SpecialFields
+
+    row_id_name = SpecialFields.ROW_ID.name
+    cols = list(write_update_cols)
+
+    for col in cols:
+        if col not in table.field_names:
+            raise ValueError(
+                f"Column '{col}' is not in target table schema."
+            )
+
+    # Pin the planner to the caller's base snapshot so row-id routing and the
+    # commit-time conflict check agree even if a concurrent commit lands (mirrors
+    # the delete path).
+    from pypaimon.common.options.core_options import CoreOptions
+    scan_table = (
+        table.copy_without_time_travel({CoreOptions.SCAN_SNAPSHOT_ID.key(): str(base_snapshot_id)})
+        if base_snapshot_id is not None else table
+    )
+    from pypaimon.write.row_id_plan import capture_row_id_plan
+    # Recovery can reuse a partition-pruned plan with complete file groups.
+    # capture_row_id_plan validates it against the pinned snapshot.
+    planner = capture_row_id_plan(scan_table, scan_plan)
+    sorted_first_row_ids = list(planner.first_row_ids)
+    if not sorted_first_row_ids:
+        return [], 0, []
+
+    num_partitions = _resolve_row_id_num_partitions(
+        num_partitions,
+        estimated_size_bytes,
+        estimated_num_rows,
+        len(sorted_first_row_ids),
+        data_context=data_context,
+    )
+    if materialize_before_routing:
+        # Keep the matched join and file-routing shuffle in separate Ray jobs.
+        update_ds = update_ds.materialize()
+
+    # Capture files and the resolved snapshot together. Workers must not plan
+    # again after later append/compaction commits.
+    files_info = planner
+    precomputed_info_ref = ray.put(files_info)
+
+    frid_col = "_FIRST_ROW_ID"
+    sentinel_row_id = -1
+    captured_sorted = sorted_first_row_ids
+
+    def _assign_frid(batch: pa.Table) -> pa.Table:
+        return batch.append_column(frid_col, planner.route(batch.column(row_id_name)))
+
+    map_kwargs = _map_kwargs(ray_remote_args)
+    with_frid = update_ds.map_batches(_assign_frid, **map_kwargs)
+
+    from pypaimon.schema.data_types import PyarrowFieldParser
+    target_pa = PyarrowFieldParser.from_paimon_schema(table.table_schema.fields)
+    update_schema = build_update_schema(target_pa, cols, row_id_name)
+    # Ray drops the schema of an empty shuffle input. A negative row id keeps
+    # the group-by schema in a separate group that is never written.
+    sentinel = pa.Table.from_arrays(
+        [pa.array([sentinel_row_id], type=pa.int64())]
+        + [pa.nulls(1, type=update_schema.field(col).type) for col in cols],
+        schema=update_schema,
+    ).append_column(
+        frid_col, pa.array([sentinel_row_id], type=pa.int64())
+    )
+    with_frid = with_frid.union(ray.data.from_arrow(sentinel))
+
+    captured_table = planner.table
+    captured_cols = cols
+
+    def _apply_group(group: pa.Table) -> pa.Table:
+        if group.column(frid_col)[0].as_py() == sentinel_row_id:
+            return pa.Table.from_pydict({
+                "msgs_blob": pa.array([], type=pa.binary()),
+                "n_updated": pa.array([], type=pa.int64()),
+                "row_ids_blob": pa.array([], type=pa.binary()),
+            })
+
+        if (
+            pc.count_distinct(group.column(row_id_name)).as_py()
+            != group.num_rows
+        ):
+            raise ValueError(
+                "MERGE matched multiple source rows to the same "
+                "target _ROW_ID. Deduplicate the source before "
+                "merging."
+            )
+
+        for_update = group.drop_columns([frid_col])
+        info = ray.get(precomputed_info_ref)
+        row_ids = (
+            for_update.column(row_id_name).to_pylist()
+            if collect_row_ids else []
+        )
+        update = captured_table.new_batch_write_builder().new_update()
+        worker = update.new_update_by_row_id(_precomputed_files_info=info)
+        from pypaimon.write.backend_dispatch import validate_row_id_update_rows
+        validate_row_id_update_rows(
+            worker, info, int(group[frid_col][0].as_py()), for_update[row_id_name])
+        msgs = worker.update_columns(for_update, list(captured_cols))
+        return pa.Table.from_pydict({
+            "msgs_blob": [pickle.dumps(msgs)],
+            "n_updated": pa.array(
+                [for_update.num_rows], type=pa.int64()
+            ),
+            "row_ids_blob": pa.array(
+                [pickle.dumps(row_ids)], type=pa.binary()
+            ),
+        })
+
+    # One group per target data file; bounded by file count and num_partitions.
+    group_partitions = max(
+        1, min(len(captured_sorted), num_partitions)
+    )
+    msgs_ds = with_frid.groupby(
+        frid_col, num_partitions=group_partitions
+    ).map_groups(_apply_group, **map_kwargs)
+
+    all_msgs: list = []
+    num_updated = 0
+    action_row_ids = []
+    for batch in msgs_ds.iter_batches(batch_format="pyarrow"):
+        for blob in batch.column("msgs_blob").to_pylist():
+            all_msgs.extend(pickle.loads(blob))
+        for n in batch.column("n_updated").to_pylist():
+            num_updated += n
+        if collect_row_ids:
+            for blob in batch.column("row_ids_blob").to_pylist():
+                action_row_ids.extend(pickle.loads(blob))
+    return all_msgs, num_updated, action_row_ids
+
+
+def _read_output_schema(table, read_cols: Sequence[str]) -> "pa.Schema":
+    """Result schema: each projected column's type plus int64 ``_ROW_ID``, in
+    ``read_cols`` order. Shared by the empty-result paths so they can't drift."""
+    from pypaimon.schema.arrow_schema import read_arrow_schema
+    from pypaimon.table.special_fields import SpecialFields
+
+    full = read_arrow_schema(table.table_schema.fields + [SpecialFields.ROW_ID])
+    return pa.schema([full.field(col) for col in read_cols])
+
+
+def distributed_read_by_row_id(
+    row_ids_ds,
+    table,
+    projection: Sequence[str],
+    *,
+    num_partitions: Optional[int],
+    ray_remote_args: Optional[Dict[str, Any]] = None,
+    estimated_size_bytes: Optional[int] = None,
+    estimated_num_rows: Optional[int] = None,
+    data_context=None,
+):
+    """Read ``projection`` for the ``_ROW_ID``s in ``row_ids_ds``, routing each to its
+    owning file and reading only the matched rows via ``IndexedSplit`` slicing (blob
+    resolved). ``table`` carries the resolved read snapshot. Returns a
+    ``ray.data.Dataset`` of ``(*projection, _ROW_ID)``, or ``None`` if the target
+    is empty. Read-side mirror of ``distributed_update_apply``.
+    """
+    import ray
+
+    from pypaimon.table.special_fields import SpecialFields
+
+    row_id_name = SpecialFields.ROW_ID.name
+    read_cols = list(projection)
+    if row_id_name not in read_cols:
+        read_cols.append(row_id_name)
+
+    # Typed empty block so all output blocks share one schema.
+    empty_out = _read_output_schema(table, read_cols).empty_table()
+
+    # The caller pinned the resolved snapshot, including any retained tag metadata.
+    from pypaimon.write.row_id_plan import capture_row_id_plan
+    planner = capture_row_id_plan(table)
+    sorted_first_row_ids = list(planner.first_row_ids)
+    if not sorted_first_row_ids:
+        return None
+
+    num_partitions = _resolve_row_id_num_partitions(
+        num_partitions,
+        estimated_size_bytes,
+        estimated_num_rows,
+        len(sorted_first_row_ids),
+        data_context=data_context,
+    )
+
+    precomputed_info_ref = ray.put(planner)
+    frid_col = "_FIRST_ROW_ID"
+
+    def _assign_frid(batch: pa.Table) -> pa.Table:
+        return batch.append_column(frid_col, planner.route(batch.column(row_id_name)))
+
+    captured_table = planner.table  # read the captured view used for routing
+    captured_read_cols = read_cols
+    captured_empty = empty_out
+
+    def _read_group(group: pa.Table) -> pa.Table:
+        if group.num_rows == 0:
+            return captured_empty
+        info = ray.get(precomputed_info_ref)
+        selected = info.select(group.column(row_id_name))
+        read = captured_table.new_read_builder().with_projection(
+            captured_read_cols
+        ).new_read()
+        return read.to_arrow(selected.splits())
+
+    map_kwargs = _map_kwargs(ray_remote_args)
+    with_frid = row_ids_ds.map_batches(_assign_frid, **map_kwargs)
+    group_partitions = max(1, min(len(sorted_first_row_ids), num_partitions))
+    return with_frid.groupby(frid_col, num_partitions=group_partitions).map_groups(
+        _read_group, **map_kwargs
+    )
+
+
+def distributed_delete_apply(
+    delete_ds,
+    table,
+    *,
+    num_partitions: int,
+    ray_remote_args: Optional[Dict[str, Any]] = None,
+    base_snapshot_id: Optional[int] = None,
+    collect_row_ids: bool = False,
+    materialize_before_routing: bool = False,
+) -> Tuple[list, int, list]:
+    import pickle
+
+    import pyarrow.compute as pc
+    import ray
+
+    from pypaimon.common.options.core_options import CoreOptions
+    from pypaimon.table.special_fields import SpecialFields
+    from pypaimon.write.table_delete import TableDeleteByRowId
+
+    row_id_name = SpecialFields.ROW_ID.name
+    scan_table = (
+        table.copy_without_time_travel({CoreOptions.SCAN_SNAPSHOT_ID.key(): str(base_snapshot_id)})
+        if base_snapshot_id is not None else table
+    )
+
+    from pypaimon.write.row_id_plan import capture_row_id_plan
+    anchor_info = capture_row_id_plan(scan_table)
+    if not anchor_info.anchors:
+        return [], 0, []
+
+    if materialize_before_routing:
+        # Keep the matched join and file-routing shuffle in separate Ray jobs.
+        delete_ds = delete_ds.materialize()
+
+    precomputed_info_ref = ray.put(anchor_info)
+
+    bucket_owners = anchor_info.route_by_bucket(pa.array(anchor_info.first_row_ids, type=pa.int64()))
+    unique_group_count = len(set(bucket_owners.to_pylist()))
+    group_col = "_DELETE_GROUP_KEY"
+
+    def _assign_group(batch: pa.Table) -> pa.Table:
+        return batch.append_column(group_col, anchor_info.route_by_bucket(batch.column(row_id_name)))
+
+    map_kwargs = _map_kwargs(ray_remote_args)
+    with_group = delete_ds.map_batches(_assign_group, **map_kwargs)
+    captured_table = anchor_info.table
+
+    def _apply_group(group: pa.Table) -> pa.Table:
+        if group.num_rows == 0:
+            return pa.Table.from_pydict({
+                "msgs_blob": pa.array([], type=pa.binary()),
+                "n_deleted": pa.array([], type=pa.int64()),
+                "row_ids_blob": pa.array([], type=pa.binary()),
+            })
+
+        if (
+            pc.count_distinct(group.column(row_id_name)).as_py()
+            != group.num_rows
+        ):
+            raise ValueError(
+                "MERGE matched multiple source rows to the same "
+                "target _ROW_ID. Deduplicate the source before "
+                "merging."
+            )
+
+        row_ids = group.column(row_id_name)
+        worker = TableDeleteByRowId(
+            captured_table,
+            _precomputed_anchor_ranges=ray.get(precomputed_info_ref),
+        )
+        msgs = worker.delete(row_ids)
+        return pa.Table.from_pydict({
+            "msgs_blob": pa.array([pickle.dumps(msgs)], type=pa.binary()),
+            "n_deleted": pa.array([len(row_ids)], type=pa.int64()),
+            "row_ids_blob": pa.array(
+                [pickle.dumps(row_ids.to_pylist() if collect_row_ids else [])],
+                type=pa.binary(),
+            ),
+        })
+
+    group_partitions = max(1, min(unique_group_count, num_partitions))
+    msgs_ds = with_group.groupby(
+        group_col, num_partitions=group_partitions
+    ).map_groups(_apply_group, **map_kwargs)
+
+    all_msgs: list = []
+    num_deleted = 0
+    action_row_ids = []
+    for batch in msgs_ds.iter_batches(batch_format="pyarrow"):
+        for blob in batch.column("msgs_blob").to_pylist():
+            all_msgs.extend(pickle.loads(blob))
+        for n in batch.column("n_deleted").to_pylist():
+            num_deleted += n
+        if collect_row_ids:
+            for blob in batch.column("row_ids_blob").to_pylist():
+                action_row_ids.extend(pickle.loads(blob))
+    return all_msgs, num_deleted, action_row_ids
+
+
+def build_not_matched_insert_ds(
+    *,
+    target_identifier: str,
+    source_ds,
+    target_on: Sequence[str],
+    source_on: Sequence[str],
+    clauses: List[_NormalizedClause],
+    target_field_names: Sequence[str],
+    target_pa_schema: pa.Schema,
+    catalog_options: Dict[str, str],
+    num_partitions: int,
+    target_empty: bool = False,
+    snapshot_id: Optional[int] = None,
+    ray_remote_args: Optional[Dict[str, Any]] = None,
+    native_enabled: bool = False,
+):
+    from pypaimon.ray.ray_paimon import read_paimon
+
+    captured_field_names = list(target_field_names)
+    out_schema = target_pa_schema
+
+    source_cols = _resolve_source_projection(
+        clauses, source_on, source_ds.schema().names,
+    )
+    source_ds = source_ds.select_columns(source_cols)
+    source_renamed = source_ds.rename_columns(
+        {c: f"s.{c}" for c in source_cols}
+    )
+
+    if target_empty:
+        unmatched = source_renamed.repartition(num_partitions)
+    else:
+        target_ds = read_paimon(
+            target_identifier, catalog_options,
+            projection=list(target_on), snapshot_id=snapshot_id,
+        )
+        target_renamed = target_ds.rename_columns(
+            {c: f"t.{c}" for c in target_on}
+        )
+        unmatched = source_renamed.join(
+            target_renamed,
+            join_type="left_anti",
+            num_partitions=num_partitions,
+            on=tuple(f"s.{c}" for c in source_on),
+            right_on=tuple(f"t.{c}" for c in target_on),
+        )
+
+    from pypaimon.write.backend_dispatch import create_merge_batch_transform
+
+    _transform = create_merge_batch_transform(
+        'insert', clauses, captured_field_names, out_schema,
+        native_enabled=native_enabled,
+    )
+
+    return unmatched.map_batches(
+        _transform, **_map_kwargs(ray_remote_args)
+    )
+
+
+def distributed_write_collect_msgs(
+    insert_ds,
+    table,
+    *,
+    ray_remote_args: Optional[Dict[str, Any]],
+    concurrency: Optional[int],
+) -> list:
+    from pypaimon.write.ray_datasink import PaimonDatasink
+
+    class _CollectingDatasink(PaimonDatasink):
+        def __init__(self, t):
+            super().__init__(t, overwrite=False)
+            self.collected: list = []
+
+        def on_write_complete(self, write_result):
+            self.collected = [
+                m
+                for batch in self._extract_write_returns(write_result)
+                for m in batch
+                if not m.is_empty()
+            ]
+
+    sink = _CollectingDatasink(table)
+    write_kwargs: Dict[str, Any] = {}
+    if ray_remote_args is not None:
+        write_kwargs["ray_remote_args"] = ray_remote_args
+    if concurrency is not None:
+        write_kwargs["concurrency"] = concurrency
+    insert_ds.write_datasink(sink, **write_kwargs)
+    return sink.collected

@@ -1,0 +1,847 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import os
+import shutil
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import pyarrow as pa
+
+from pypaimon import CatalogFactory, Schema
+from pypaimon.common.options.core_options import CoreOptions
+from pypaimon.schema.data_types import AtomicType
+from pypaimon.schema.schema_change import SchemaChange
+
+
+class SimpleTableTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tempdir = tempfile.mkdtemp()
+        cls.warehouse = os.path.join(cls.tempdir, 'warehouse')
+        cls.catalog = CatalogFactory.create({
+            'warehouse': cls.warehouse
+        })
+        cls.catalog.create_database('default', True)
+
+        cls.pa_schema = pa.schema([
+            ('pt', pa.int32()),
+            ('k', pa.int32()),
+            ('v', pa.int64())
+        ])
+        cls.pk_pa_schema = pa.schema([
+            pa.field('pt', pa.int32(), nullable=False),
+            pa.field('k', pa.int32(), nullable=False),
+            ('v', pa.int64())
+        ])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tempdir, ignore_errors=True)
+
+    def test_commit_snapshot_properties(self):
+        schema = Schema.from_pyarrow_schema(self.pa_schema)
+        self.catalog.create_table(
+            'default.test_commit_snapshot_properties', schema, False)
+        table = self.catalog.get_table(
+            'default.test_commit_snapshot_properties')
+        write_builder = table.new_batch_write_builder()
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        table_write.write_arrow(pa.Table.from_pydict({
+            'pt': [1],
+            'k': [2],
+            'v': [3],
+        }, schema=self.pa_schema))
+
+        table_commit.commit(
+            table_write.prepare_commit(),
+            snapshot_properties={'source': 'capture'},
+        )
+        table_write.close()
+        table_commit.close()
+
+        snapshot = table.snapshot_manager().get_latest_snapshot()
+        self.assertEqual({'source': 'capture'}, snapshot.properties)
+
+    def test_stream_commit_snapshot_properties(self):
+        schema = Schema.from_pyarrow_schema(self.pa_schema)
+        self.catalog.create_table(
+            'default.test_stream_commit_snapshot_properties', schema, False)
+        table = self.catalog.get_table(
+            'default.test_stream_commit_snapshot_properties')
+        write_builder = table.new_stream_write_builder()
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        table_write.write_arrow(pa.Table.from_pydict({
+            'pt': [1],
+            'k': [2],
+            'v': [3],
+        }, schema=self.pa_schema))
+
+        table_commit.commit(
+            table_write.prepare_commit(42),
+            42,
+            snapshot_properties={'checkpoint': '42'},
+        )
+        table_write.close()
+        table_commit.close()
+
+        snapshot = table.snapshot_manager().get_latest_snapshot()
+        self.assertEqual({'checkpoint': '42'}, snapshot.properties)
+
+    def test_tag_scan(self):
+        """
+        Test reading from a specific tag.
+
+        1. Write data in 3 commits
+        2. Create a tag at snapshot 2
+        3. Read from the tag and verify only data from snapshots 1 and 2 is returned
+        """
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_tag_scan', schema, False)
+        table = self.catalog.get_table('default.test_tag_scan')
+
+        write_builder = table.new_batch_write_builder()
+
+        # First commit: pt=1, k=10, v=100 and pt=1, k=20, v=200
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data1 = pa.Table.from_pydict({
+            'pt': [1, 1],
+            'k': [10, 20],
+            'v': [100, 200]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data1)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Second commit: pt=2, k=30, v=101 and pt=2, k=40, v=201
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data2 = pa.Table.from_pydict({
+            'pt': [2, 2],
+            'k': [30, 40],
+            'v': [101, 201]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data2)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Third commit: pt=3, k=50, v=500 and pt=3, k=60, v=600
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data3 = pa.Table.from_pydict({
+            'pt': [3, 3],
+            'k': [50, 60],
+            'v': [500, 600]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data3)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Create tag at snapshot 2
+        table.create_tag("tag2", snapshot_id=2)
+
+        # Read from tag2 using scan.tag-name option
+        table_with_tag = table.copy({CoreOptions.SCAN_TAG_NAME.key(): "tag2"})
+        read_builder = table_with_tag.new_read_builder()
+        table_scan = read_builder.new_scan()
+        table_read = read_builder.new_read()
+        result = table_read.to_arrow(table_scan.plan().splits())
+
+        # Verify: should only contain data from snapshot 1 and 2
+        # (pt=1, k=10, v=100), (pt=1, k=20, v=200), (pt=2, k=30, v=101), (pt=2, k=40, v=201)
+        result_sorted = result.sort_by([('pt', 'ascending'), ('k', 'ascending')])
+
+        expected = pa.Table.from_pydict({
+            'pt': [1, 1, 2, 2],
+            'k': [10, 20, 30, 40],
+            'v': [100, 200, 101, 201]
+        }, schema=self.pk_pa_schema)
+
+        self.assertEqual(result_sorted.num_rows, 4)
+        self.assertEqual(result_sorted.column('pt').to_pylist(), expected.column('pt').to_pylist())
+        self.assertEqual(result_sorted.column('k').to_pylist(), expected.column('k').to_pylist())
+        self.assertEqual(result_sorted.column('v').to_pylist(), expected.column('v').to_pylist())
+
+    def test_non_existing_tag(self):
+        """
+        Test that reading from a non-existing tag raises an error.
+        """
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_non_existing_tag', schema, False)
+        table = self.catalog.get_table('default.test_non_existing_tag')
+
+        # Try to read from a non-existing tag
+        table_with_tag = table.copy({CoreOptions.SCAN_TAG_NAME.key(): "non-existing"})
+        read_builder = table_with_tag.new_read_builder()
+        table_scan = read_builder.new_scan()
+
+        with self.assertRaises(ValueError) as context:
+            table_scan.plan()
+
+        self.assertIn("non-existing", str(context.exception))
+        self.assertIn("doesn't exist", str(context.exception))
+
+    def test_tag_create_and_delete(self):
+        """Test creating and deleting tags."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_tag_create_delete', schema, False)
+        table = self.catalog.get_table('default.test_tag_create_delete')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write some data
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data = pa.Table.from_pydict({
+            'pt': [1, 1],
+            'k': [10, 20],
+            'v': [100, 200]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Create a tag
+        table.create_tag("test_tag")
+
+        # Verify tag exists
+        tag_manager = table.tag_manager()
+        self.assertTrue(tag_manager.tag_exists("test_tag"))
+
+        # Get the tag
+        tag = tag_manager.get("test_tag")
+        self.assertIsNotNone(tag)
+        self.assertEqual(tag.id, 1)
+
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data = pa.Table.from_pydict({
+            'pt': [1, 1],
+            'k': [10, 20],
+            'v': [100, 200]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        table.create_tag("test_tag_2")
+        all_tags = set(table.list_tags())
+        self.assertEqual(all_tags, {"test_tag", "test_tag_2"})
+
+        # Delete the tag
+        result = table.delete_tag("test_tag")
+        self.assertTrue(result)
+
+        all_tags = table.list_tags()
+        self.assertEqual(all_tags, ["test_tag_2"])
+
+        # Verify tag no longer exists
+        self.assertFalse(tag_manager.tag_exists("test_tag"))
+
+    def test_tag_ignore_if_exists(self):
+        """Test creating a tag with ignore_if_exists=True."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_tag_ignore_exists', schema, False)
+        table = self.catalog.get_table('default.test_tag_ignore_exists')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write some data
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data = pa.Table.from_pydict({
+            'pt': [1],
+            'k': [10],
+            'v': [100]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Create a tag
+        table.create_tag("duplicate_tag")
+
+        # Try to create the same tag again without ignore_if_exists - should raise error
+        with self.assertRaises(ValueError) as context:
+            table.create_tag("duplicate_tag")
+        self.assertIn("already exists", str(context.exception))
+
+        # Create the same tag with ignore_if_exists=True - should not raise error
+        table.create_tag("duplicate_tag", ignore_if_exists=True)
+
+    def test_tag_rename(self):
+        """Test renaming a tag."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_tag_rename', schema, False)
+        table = self.catalog.get_table('default.test_tag_rename')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write some data - snapshot 1
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data = pa.Table.from_pydict({
+            'pt': [1],
+            'k': [10],
+            'v': [100]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Create a tag
+        table.create_tag("old_tag")
+
+        # Rename the tag
+        table.rename_tag("old_tag", "new_tag")
+
+        # Verify old tag no longer exists
+        tags = table.list_tags()
+        self.assertNotIn("old_tag", tags)
+        self.assertIn("new_tag", tags)
+
+        # Verify tag content is preserved
+        tag_manager = table.tag_manager()
+        tag = tag_manager.get("new_tag")
+        self.assertIsNotNone(tag)
+        self.assertEqual(tag.id, 1)
+
+    def test_tag_rename_nonexistent(self):
+        """Test renaming a nonexistent tag."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_tag_rename_nonexistent', schema, False)
+        table = self.catalog.get_table('default.test_tag_rename_nonexistent')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write some data
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data = pa.Table.from_pydict({
+            'pt': [1],
+            'k': [10],
+            'v': [100]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Try to rename nonexistent tag
+        with self.assertRaises(ValueError) as context:
+            table.rename_tag("nonexistent", "new_tag")
+        self.assertIn("doesn't exist", str(context.exception))
+
+    def test_tag_rename_to_existing(self):
+        """Test renaming a tag to a name that already exists."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_tag_rename_to_existing', schema, False)
+        table = self.catalog.get_table('default.test_tag_rename_to_existing')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write some data - snapshot 1
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data = pa.Table.from_pydict({
+            'pt': [1],
+            'k': [10],
+            'v': [100]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Create two tags
+        table.create_tag("tag1")
+        table.create_tag("tag2")
+
+        # Try to rename tag1 to tag2 (which already exists)
+        with self.assertRaises(ValueError) as context:
+            table.rename_tag("tag1", "tag2")
+        self.assertIn("already exists", str(context.exception))
+
+        # Verify both original tags still exist
+        tags = table.list_tags()
+        self.assertIn("tag1", tags)
+        self.assertIn("tag2", tags)
+
+    def test_tag_rename_and_scan(self):
+        """Test that renaming a tag and then scanning by new name works correctly."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_tag_rename_scan', schema, False)
+        table = self.catalog.get_table('default.test_tag_rename_scan')
+
+        write_builder = table.new_batch_write_builder()
+
+        # First commit
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data1 = pa.Table.from_pydict({
+            'pt': [1, 1],
+            'k': [10, 20],
+            'v': [100, 200]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data1)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Second commit
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data2 = pa.Table.from_pydict({
+            'pt': [2, 2],
+            'k': [30, 40],
+            'v': [101, 201]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data2)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Create tag at snapshot 1
+        table.create_tag("old_tag", snapshot_id=1)
+
+        # Rename the tag
+        table.rename_tag("old_tag", "new_tag")
+
+        # Read from the renamed tag
+        table_with_tag = table.copy({CoreOptions.SCAN_TAG_NAME.key(): "new_tag"})
+        read_builder = table_with_tag.new_read_builder()
+        table_scan = read_builder.new_scan()
+        table_read = read_builder.new_read()
+        result = table_read.to_arrow(table_scan.plan().splits())
+
+        # Verify: should only contain data from snapshot 1
+        result_sorted = result.sort_by([('pt', 'ascending'), ('k', 'ascending')])
+
+        expected = pa.Table.from_pydict({
+            'pt': [1, 1],
+            'k': [10, 20],
+            'v': [100, 200]
+        }, schema=self.pk_pa_schema)
+
+        self.assertEqual(result_sorted.num_rows, 2)
+        self.assertEqual(result_sorted.column('pt').to_pylist(), expected.column('pt').to_pylist())
+        self.assertEqual(result_sorted.column('k').to_pylist(), expected.column('k').to_pylist())
+        self.assertEqual(result_sorted.column('v').to_pylist(), expected.column('v').to_pylist())
+
+    def test_schema_evolution_tag_read(self):
+        pa_schema = pa.schema([
+            ('user_id', pa.int64()),
+            ('item_id', pa.int64()),
+            ('dt', pa.string())
+        ])
+        schema = Schema.from_pyarrow_schema(pa_schema, partition_keys=['dt'])
+        name = 'default.test_schema_evolution'
+        self.catalog.create_table(name, schema, False)
+        table = self.catalog.get_table(name)
+        expected = pa.Table.from_pydict({
+            'user_id': [5, 6, 7, 8, 55, 66, 77, 88],
+            'item_id': [1005, 1006, 1007, 1008, 1005, 1006, 1007, 1008],
+            'dt': ["p2", "p1", "p2", "p2", "p2", "p1", "p2", "p2"]
+        }, schema=pa_schema)
+        write_builder = table.new_batch_write_builder()
+        for data in (expected.slice(0, 4), expected.slice(4)):
+            table_write = write_builder.new_write()
+            table_commit = write_builder.new_commit()
+            try:
+                table_write.write_arrow(data)
+                table_commit.commit(table_write.prepare_commit())
+            finally:
+                table_write.close()
+                table_commit.close()
+        table.create_tag("tag2", snapshot_id=2)
+
+        # Evolve the same table and write newer data beyond the tagged snapshot.
+        self.catalog.alter_table(name, [SchemaChange.add_column('behavior', AtomicType('STRING'))])
+        table = self.catalog.get_table(name)
+        self.assertEqual(table.table_schema.id, 1)
+        write_builder = table.new_batch_write_builder()
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        try:
+            table_write.write_arrow(pa.Table.from_pydict({
+                'user_id': [99],
+                'item_id': [1009],
+                'dt': ['p3'],
+                'behavior': ['new'],
+            }, schema=pa_schema.append(pa.field('behavior', pa.string()))))
+            table_commit.commit(table_write.prepare_commit())
+        finally:
+            table_write.close()
+            table_commit.close()
+
+        table_with_tag = table.copy({CoreOptions.SCAN_TAG_NAME.key(): "tag2"})
+        self.assertEqual(table_with_tag.table_schema.id, 0)
+        read_builder = table_with_tag.new_read_builder()
+        table_scan = read_builder.new_scan()
+        table_read = read_builder.new_read()
+
+        result = table_read.to_arrow(table_scan.plan().splits())
+
+        self.assertEqual(expected, result.sort_by('user_id'))
+
+    def test_table_rollback_to_snapshot(self):
+        """Test table-level rollback to a specific snapshot."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_rollback_snapshot', schema, False)
+        table = self.catalog.get_table('default.test_rollback_snapshot')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write 5 commits
+        for i in range(5):
+            table_write = write_builder.new_write()
+            table_commit = write_builder.new_commit()
+            data = pa.Table.from_pydict({
+                'pt': [1],
+                'k': [i],
+                'v': [i * 100]
+            }, schema=self.pk_pa_schema)
+            table_write.write_arrow(data)
+            table_commit.commit(table_write.prepare_commit())
+            table_write.close()
+            table_commit.close()
+
+        snapshot_mgr = table.snapshot_manager()
+        self.assertEqual(snapshot_mgr.get_latest_snapshot().id, 5)
+
+        changelog_mgr = table.changelog_manager()
+        for snapshot_id in (2, 5):
+            table.file_io.copy_file(snapshot_mgr.get_snapshot_path(snapshot_id),
+                                    changelog_mgr.long_lived_changelog_path(snapshot_id))
+        changelog_mgr.commit_long_lived_changelog_earliest_hint(2)
+        changelog_mgr.commit_long_lived_changelog_latest_hint(5)
+
+        # Retry a rollback after LATEST was advanced and a newer snapshot is missing.
+        table.file_io.overwrite_file_utf8(snapshot_mgr.latest_file, "3")
+        table.file_io.delete(snapshot_mgr.get_snapshot_path(4))
+        table.rollback_to(3)
+
+        self.assertEqual(snapshot_mgr.get_latest_snapshot().id, 3)
+        self.assertIsNone(snapshot_mgr.get_snapshot_by_id(4))
+        self.assertIsNone(snapshot_mgr.get_snapshot_by_id(5))
+        self.assertTrue(changelog_mgr.long_lived_changelog_exists(2))
+        self.assertFalse(changelog_mgr.long_lived_changelog_exists(5))
+        self.assertEqual(changelog_mgr.latest_long_lived_changelog_id(), 2)
+        self.assertEqual(table.file_io.read_file_utf8(
+            f"{changelog_mgr.changelog_directory()}/LATEST"), "2")
+
+    def test_table_rollback_to_tag(self):
+        """Test table-level rollback to a specific tag."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_rollback_tag', schema, False)
+        table = self.catalog.get_table('default.test_rollback_tag')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write 5 commits and create tags
+        for i in range(5):
+            table_write = write_builder.new_write()
+            table_commit = write_builder.new_commit()
+            data = pa.Table.from_pydict({
+                'pt': [1],
+                'k': [i],
+                'v': [i * 100]
+            }, schema=self.pk_pa_schema)
+            table_write.write_arrow(data)
+            table_commit.commit(table_write.prepare_commit())
+            table_write.close()
+            table_commit.close()
+            table.create_tag("v{}".format(i + 1))
+
+        snapshot_mgr = table.snapshot_manager()
+        tag_mgr = table.tag_manager()
+        self.assertEqual(snapshot_mgr.get_latest_snapshot().id, 5)
+
+        # Rollback to tag v3
+        with patch.object(type(tag_mgr), "delete_tag", side_effect=AssertionError(
+                "Rollback must delete tag files directly")):
+            table.rollback_to("v3")
+
+        self.assertEqual(snapshot_mgr.get_latest_snapshot().id, 3)
+        # Tags with snapshot > 3 should be cleaned
+        self.assertFalse(tag_mgr.tag_exists("v4"))
+        self.assertFalse(tag_mgr.tag_exists("v5"))
+        self.assertEqual(sorted(tag_mgr.list_tags()), ["v1", "v2", "v3"])
+
+    def test_table_rollback_to_tag_after_snapshot_expired(self):
+        """Rolling back to a tag whose snapshot expired must move EARLIEST back to it."""
+        schema = Schema.from_pyarrow_schema(self.pa_schema)
+        self.catalog.create_table('default.test_rollback_expired_tag', schema, False)
+        table = self.catalog.get_table('default.test_rollback_expired_tag')
+
+        def write(k):
+            write_builder = table.new_batch_write_builder()
+            table_write = write_builder.new_write()
+            table_commit = write_builder.new_commit()
+            table_write.write_arrow(pa.Table.from_pydict(
+                {'pt': [1], 'k': [k], 'v': [k * 100]}, schema=self.pa_schema))
+            table_commit.commit(table_write.prepare_commit())
+            table_write.close()
+            table_commit.close()
+
+        def read_k(options):
+            read_builder = table.copy(options).new_read_builder()
+            splits = read_builder.new_scan().plan().splits()
+            return sorted(read_builder.new_read().to_arrow(splits)['k'].to_pylist())
+
+        for k in range(1, 6):
+            write(k)
+        table.create_tag("v2", 2)
+
+        # Expire snapshots 1-4 the way snapshot expiration leaves the snapshot
+        # directory: their files are gone and EARLIEST points at snapshot 5.
+        # The tag keeps the metadata and data files of snapshot 2.
+        snapshot_mgr = table.snapshot_manager()
+        changelog_mgr = table.changelog_manager()
+        for snapshot_id in (3, 4):
+            table.file_io.copy_file(snapshot_mgr.get_snapshot_path(snapshot_id),
+                                    changelog_mgr.long_lived_changelog_path(snapshot_id))
+        changelog_mgr.commit_long_lived_changelog_earliest_hint(3)
+        for snapshot_id in range(1, 5):
+            table.file_io.delete(snapshot_mgr.get_snapshot_path(snapshot_id))
+        earliest_file = "{}/EARLIEST".format(snapshot_mgr.snapshot_dir)
+        table.file_io.overwrite_file_utf8(earliest_file, "5")
+
+        overwrite_hint = table.file_io.overwrite_file_utf8
+
+        def fail_earliest_hint(path, content):
+            if path == earliest_file:
+                raise OSError("EARLIEST write failed")
+            overwrite_hint(path, content)
+
+        with patch.object(table.file_io, "overwrite_file_utf8", side_effect=fail_earliest_hint):
+            with self.assertRaisesRegex(OSError, "EARLIEST write failed"):
+                table.rollback_to(2)
+
+        table.rollback_to("v2")
+        self.assertEqual(list(changelog_mgr.changelogs()), [])
+        self.assertIsNone(changelog_mgr.earliest_long_lived_changelog_id())
+        self.assertIsNone(changelog_mgr.latest_long_lived_changelog_id())
+        self.assertEqual(table.file_io.read_file_utf8(
+            f"{changelog_mgr.changelog_directory()}/LATEST"), "-1")
+        for k in range(6, 9):
+            write(k)
+
+        s2, s3, s5 = (snapshot_mgr.get_snapshot_by_id(i).time_millis for i in (2, 3, 5))
+        self.assertEqual(
+            read_k({'incremental-between-timestamp': '{},{}'.format(s2, s5)}), [6, 7, 8])
+        self.assertEqual(read_k({'scan.timestamp-millis': str(s3)}), [1, 2, 6])
+        self.assertEqual(table.file_io.read_file_utf8(earliest_file).strip(), "2")
+        self.assertEqual(snapshot_mgr.try_get_earliest_snapshot().id, 2)
+
+    def test_table_rollback_to_nonexistent_snapshot(self):
+        """Test that rollback to a non-existent snapshot raises ValueError."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_rollback_no_snap', schema, False)
+        table = self.catalog.get_table('default.test_rollback_no_snap')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write 2 commits
+        for i in range(2):
+            table_write = write_builder.new_write()
+            table_commit = write_builder.new_commit()
+            data = pa.Table.from_pydict({
+                'pt': [1],
+                'k': [i],
+                'v': [i * 100]
+            }, schema=self.pk_pa_schema)
+            table_write.write_arrow(data)
+            table_commit.commit(table_write.prepare_commit())
+            table_write.close()
+            table_commit.close()
+
+        with self.assertRaises(ValueError) as context:
+            table.rollback_to(99)
+        self.assertIn("Rollback snapshot", str(context.exception))
+        self.assertIn("99", str(context.exception))
+        self.assertIn("doesn't exist", str(context.exception))
+
+    def test_table_rollback_to_nonexistent_tag(self):
+        """Test that rollback to a non-existent tag raises ValueError."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_rollback_no_tag', schema, False)
+        table = self.catalog.get_table('default.test_rollback_no_tag')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write 1 commit
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data = pa.Table.from_pydict({
+            'pt': [1],
+            'k': [10],
+            'v': [100]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        with self.assertRaises(ValueError) as context:
+            table.rollback_to("no-such-tag")
+        self.assertIn("no-such-tag", str(context.exception))
+        self.assertIn("doesn't exist", str(context.exception))
+
+    def test_table_rollback_to_timestamp(self):
+        """Test table-level rollback to a timestamp."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_rollback_ts', schema, False)
+        table = self.catalog.get_table('default.test_rollback_ts')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write 5 commits
+        for i in range(5):
+            table_write = write_builder.new_write()
+            table_commit = write_builder.new_commit()
+            data = pa.Table.from_pydict({
+                'pt': [1],
+                'k': [i],
+                'v': [i * 100]
+            }, schema=self.pk_pa_schema)
+            table_write.write_arrow(data)
+            table_commit.commit(table_write.prepare_commit())
+            table_write.close()
+            table_commit.close()
+
+        snapshot_mgr = table.snapshot_manager()
+        self.assertEqual(snapshot_mgr.get_latest_snapshot().id, 5)
+
+        # Get the timestamp of snapshot 3 and rollback to it
+        snap3 = snapshot_mgr.get_snapshot_by_id(3)
+        table.rollback_to_timestamp(snap3.time_millis)
+
+        self.assertEqual(snapshot_mgr.get_latest_snapshot().id, 3)
+        self.assertIsNone(snapshot_mgr.get_snapshot_by_id(4))
+        self.assertIsNone(snapshot_mgr.get_snapshot_by_id(5))
+
+    def test_table_rollback_to_timestamp_no_match(self):
+        """Test rollback_to_timestamp raises ValueError when no snapshot exists."""
+        schema = Schema.from_pyarrow_schema(
+            self.pa_schema,
+            primary_keys=['pt', 'k'],
+            partition_keys=['pt'],
+            options={'bucket': '3'}
+        )
+        self.catalog.create_table('default.test_rollback_ts_nomatch', schema, False)
+        table = self.catalog.get_table('default.test_rollback_ts_nomatch')
+
+        write_builder = table.new_batch_write_builder()
+
+        # Write 1 commit
+        table_write = write_builder.new_write()
+        table_commit = write_builder.new_commit()
+        data = pa.Table.from_pydict({
+            'pt': [1],
+            'k': [0],
+            'v': [100]
+        }, schema=self.pk_pa_schema)
+        table_write.write_arrow(data)
+        table_commit.commit(table_write.prepare_commit())
+        table_write.close()
+        table_commit.close()
+
+        # Use a timestamp before the first snapshot
+        snapshot_mgr = table.snapshot_manager()
+        earliest = snapshot_mgr.try_get_earliest_snapshot()
+        before_earliest = earliest.time_millis - 1
+
+        with self.assertRaises(ValueError) as context:
+            table.rollback_to_timestamp(before_earliest)
+        self.assertIn("No snapshot found", str(context.exception))

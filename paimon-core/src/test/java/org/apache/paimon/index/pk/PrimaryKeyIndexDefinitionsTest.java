@@ -1,0 +1,235 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.index.pk;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataTypes;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Tests for {@link PrimaryKeyIndexDefinitions}. */
+class PrimaryKeyIndexDefinitionsTest {
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testCreatesIndependentVectorDefinitionsAndLeavesOtherVectorsUnindexed(
+            boolean sharedOptions) {
+        Map<String, String> options = new HashMap<>();
+        options.put(
+                columnsKey(sharedOptions ? "ivf-flat" : "vector", sharedOptions),
+                " text_embedding , image_embedding ");
+        if (!sharedOptions) {
+            options.put("fields.image_embedding.pk-vector.index.type", "ivf-flat");
+            options.put("fields.text_embedding.pk-vector.index.type", "ivf-flat");
+        }
+        String suffix = sharedOptions ? "index-options" : "pk-vector.index.options";
+        options.put(
+                "fields.image_embedding." + suffix,
+                "{\"nlist\":64,\"distance.metric\":\"cosine\"}");
+        options.put(
+                "fields.text_embedding." + suffix, "{\"nlist\":128,\"distance.metric\":\"l2\"}");
+        TableSchema schema =
+                new TableSchema(
+                        0,
+                        Arrays.asList(
+                                new DataField(0, "id", DataTypes.INT().notNull()),
+                                new DataField(
+                                        1,
+                                        "image_embedding",
+                                        DataTypes.VECTOR(2, DataTypes.FLOAT())),
+                                new DataField(
+                                        2,
+                                        "text_embedding",
+                                        DataTypes.VECTOR(3, DataTypes.FLOAT())),
+                                new DataField(
+                                        3,
+                                        "stored_embedding",
+                                        DataTypes.VECTOR(4, DataTypes.FLOAT()))),
+                        3,
+                        Collections.emptyList(),
+                        Collections.singletonList("id"),
+                        options,
+                        "");
+
+        List<PrimaryKeyIndexDefinition> definitions =
+                PrimaryKeyIndexDefinitions.create(schema).definitions();
+
+        assertThat(definitions)
+                .extracting(PrimaryKeyIndexDefinition::column)
+                .containsExactly("image_embedding", "text_embedding");
+        assertThat(definitions)
+                .extracting(PrimaryKeyIndexDefinition::fieldId)
+                .containsExactly(1, 2);
+        assertThat(definitions)
+                .extracting(PrimaryKeyIndexDefinition::family)
+                .containsOnly(PrimaryKeyIndexDefinition.Family.VECTOR);
+        assertThat(definitions.get(0).options().get("ivf-flat.nlist")).isEqualTo("64");
+        assertThat(definitions.get(0).options().get("ivf-flat.metric")).isEqualTo("cosine");
+        assertThat(definitions.get(1).options().get("ivf-flat.nlist")).isEqualTo("128");
+        assertThat(definitions.get(1).options().get("ivf-flat.metric")).isEqualTo("l2");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testCreatesMixedDefinitionsInSchemaFieldOrder(boolean sharedOptions) {
+        Map<String, String> options = new HashMap<>();
+        options.put(columnsKey(sharedOptions ? "ivf-pq" : "vector", sharedOptions), "embedding");
+        if (!sharedOptions) {
+            options.put("fields.embedding.pk-vector.index.type", "ivf-pq");
+        }
+        options.put(
+                "fields.embedding." + (sharedOptions ? "index-options" : "pk-vector.index.options"),
+                "{\"nlist\":64,\"metric\":\"cosine\"}");
+        options.put(columnsKey("btree", sharedOptions), "name");
+        options.put(columnsKey("bitmap", sharedOptions), "status");
+        options.put(columnsKey("multivalue", sharedOptions), "tags");
+
+        List<PrimaryKeyIndexDefinition> definitions =
+                PrimaryKeyIndexDefinitions.create(schema(options)).definitions();
+
+        assertThat(definitions)
+                .extracting(PrimaryKeyIndexDefinition::column)
+                .containsExactly("name", "status", "embedding", "tags");
+        assertThat(definitions)
+                .extracting(PrimaryKeyIndexDefinition::family)
+                .containsExactly(
+                        PrimaryKeyIndexDefinition.Family.BTREE,
+                        PrimaryKeyIndexDefinition.Family.BITMAP,
+                        PrimaryKeyIndexDefinition.Family.VECTOR,
+                        PrimaryKeyIndexDefinition.Family.MULTI_VALUE);
+        assertThat(definitions)
+                .extracting(PrimaryKeyIndexDefinition::fieldId)
+                .containsExactly(1, 2, 3, 4);
+        assertThat(definitions)
+                .extracting(PrimaryKeyIndexDefinition::indexType)
+                .containsExactly("btree", "bitmap", "ivf-pq", "multivalue");
+        assertThat(definitions.get(2).options().get("ivf-pq.nlist")).isEqualTo("64");
+        assertThat(definitions.get(2).options().get("ivf-pq.metric")).isEqualTo("cosine");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testCreatesFullTextDefinitionWithoutIndexType(boolean sharedOptions) {
+        Map<String, String> options = new HashMap<>();
+        options.put(columnsKey("full-text", sharedOptions), "name");
+
+        List<PrimaryKeyIndexDefinition> definitions =
+                PrimaryKeyIndexDefinitions.create(schema(options)).definitions();
+
+        assertThat(definitions).hasSize(1);
+        assertThat(definitions.get(0).column()).isEqualTo("name");
+        assertThat(definitions.get(0).indexType()).isEqualTo("full-text");
+        assertThat(definitions.get(0).family().name()).isEqualTo("FULL_TEXT");
+    }
+
+    @Test
+    void testResolvesFullTextIndexOptions() {
+        Map<String, String> options = new HashMap<>();
+        options.put("pk-full-text.index.columns", "name");
+        options.put(
+                "fields.name.pk-full-text.index.options",
+                "{\"full-text.tokenizer\":\"jieba\",\"ngram.min-gram\":\"2\"}");
+
+        PrimaryKeyIndexDefinition definition =
+                PrimaryKeyIndexDefinitions.create(schema(options)).definitions().get(0);
+
+        assertThat(definition.options().get("full-text.tokenizer")).isEqualTo("jieba");
+        assertThat(definition.options().get("full-text.ngram.min-gram")).isEqualTo("2");
+        assertThat(definition.options().toMap())
+                .doesNotContainKey("pk-full-text.index.columns")
+                .doesNotContainKey("fields.name.pk-full-text.index.options");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void testCreatesFMDefinitionAndResolvesOptions(boolean sharedOptions) {
+        Map<String, String> options = new HashMap<>();
+        options.put(columnsKey("fm", sharedOptions), "name");
+        options.put("fm-index.sa-sample-rate", "16");
+        options.put(
+                sharedOptions ? "fields.name.index-options" : "fields.name.pk-fm.index.options",
+                "{\"partition-row-count\":\"2\"}");
+
+        PrimaryKeyIndexDefinition definition =
+                PrimaryKeyIndexDefinitions.create(schema(options)).definitions().get(0);
+
+        assertThat(definition.column()).isEqualTo("name");
+        assertThat(definition.indexType()).isEqualTo("fm");
+        assertThat(definition.family()).isEqualTo(PrimaryKeyIndexDefinition.Family.FM);
+        assertThat(definition.options().get("fm-index.sa-sample-rate")).isEqualTo("16");
+        assertThat(definition.options().get("fm-index.partition-row-count")).isEqualTo("2");
+    }
+
+    @Test
+    void testRejectsDuplicateColumnWithinFamily() {
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.GLOBAL_INDEX_BTREE_INDEX_COLUMNS.key(), "name,name");
+
+        assertThatThrownBy(() -> PrimaryKeyIndexDefinitions.create(schema(options)))
+                .hasMessageContaining("global-index.btree.index-columns")
+                .hasMessageContaining("duplicate")
+                .hasMessageContaining("name");
+    }
+
+    @Test
+    void testRejectsColumnConfiguredByMultipleFamilies() {
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.GLOBAL_INDEX_BTREE_INDEX_COLUMNS.key(), "name");
+        options.put(CoreOptions.GLOBAL_INDEX_BITMAP_INDEX_COLUMNS.key(), "name");
+
+        assertThatThrownBy(() -> PrimaryKeyIndexDefinitions.create(schema(options)))
+                .hasMessageContaining("name")
+                .hasMessageContaining("at most one primary-key index");
+    }
+
+    private static String columnsKey(String type, boolean sharedOptions) {
+        return sharedOptions
+                ? "global-index." + type + ".index-columns"
+                : "pk-" + type + ".index.columns";
+    }
+
+    private static TableSchema schema(Map<String, String> options) {
+        return new TableSchema(
+                0,
+                Arrays.asList(
+                        new DataField(0, "id", DataTypes.INT().notNull()),
+                        new DataField(1, "name", DataTypes.STRING()),
+                        new DataField(2, "status", DataTypes.INT()),
+                        new DataField(3, "embedding", DataTypes.VECTOR(3, DataTypes.FLOAT())),
+                        new DataField(4, "tags", DataTypes.ARRAY(DataTypes.STRING()))),
+                3,
+                Collections.emptyList(),
+                Collections.singletonList("id"),
+                options,
+                "");
+    }
+}

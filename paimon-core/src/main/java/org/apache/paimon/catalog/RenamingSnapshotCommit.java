@@ -1,0 +1,104 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.catalog;
+
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.fs.FileIO;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.operation.Lock;
+import org.apache.paimon.partition.PartitionStatistics;
+import org.apache.paimon.utils.SnapshotManager;
+
+import javax.annotation.Nullable;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.concurrent.Callable;
+
+/**
+ * A {@link SnapshotCommit} using file renaming to commit.
+ *
+ * <p>Note that when the file system is local or HDFS, rename is atomic. But if the file system is
+ * object storage, we need additional lock protection.
+ */
+public class RenamingSnapshotCommit extends SnapshotCommit {
+
+    private final SnapshotManager snapshotManager;
+    private final FileIO fileIO;
+
+    public RenamingSnapshotCommit(SnapshotManager snapshotManager, Lock lock) {
+        super(lock);
+        this.snapshotManager = snapshotManager;
+        this.fileIO = snapshotManager.fileIO();
+    }
+
+    @Override
+    protected boolean commitImpl(
+            @Nullable String baseSnapshotUuid,
+            Snapshot snapshot,
+            String branch,
+            List<PartitionStatistics> statistics)
+            throws Exception {
+        Path newSnapshotPath =
+                snapshotManager.branch().equals(branch)
+                        ? snapshotManager.snapshotPath(snapshot.id())
+                        : snapshotManager.copyWithBranch(branch).snapshotPath(snapshot.id());
+
+        Callable<Boolean> callable =
+                () -> {
+                    boolean committed;
+                    try {
+                        committed = fileIO.tryToWriteAtomic(newSnapshotPath, snapshot.toJson());
+                    } catch (IOException e) {
+                        // the rename may have succeeded even if the file system reports an
+                        // error, check the snapshot file below
+                        if (!fileIO.exists(newSnapshotPath)) {
+                            throw e;
+                        }
+                        committed = false;
+                    }
+                    if (!committed) {
+                        if (!fileIO.exists(newSnapshotPath)) {
+                            throw new IOException(
+                                    "Commit snapshot "
+                                            + snapshot.id()
+                                            + " failed and "
+                                            + newSnapshotPath
+                                            + " not found");
+                        }
+                        committed =
+                                snapshot.equals(
+                                        Snapshot.fromJson(fileIO.readFileUtf8(newSnapshotPath)));
+                    }
+
+                    if (committed) {
+                        snapshotManager.commitLatestHint(snapshot.id());
+                    }
+                    return committed;
+                };
+        // fs.rename may not return false if the target file already exists, or even be atomic.
+        // The bound lock lets us check existence before publishing.
+        if (fileIO.exists(newSnapshotPath)) {
+            return false;
+        }
+        // Checking existence may outlast the lease, so check it again before writing.
+        ensureValid();
+        return callable.call();
+    }
+}

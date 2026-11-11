@@ -1,0 +1,535 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import logging
+import os
+import threading
+from collections import OrderedDict
+
+import pyarrow as pa
+from pyarrow import PythonFile
+from pyarrow._fs import FileSystemHandler
+from pyarrow.fs import FileInfo, FileSelector, FileType
+
+# The PyArrow and PVFS paths use separate pyjindo modules.
+try:
+    import pyjindo.fs as jfs
+    import pyjindo.util as jutil
+    JINDO_AVAILABLE = True
+except ImportError:
+    JINDO_AVAILABLE = False
+    jfs = None
+    jutil = None
+
+try:
+    import pyjindo.ossfs as jossfs
+    JINDO_OSSFS_AVAILABLE = True
+except ImportError:
+    jossfs = None
+    JINDO_OSSFS_AVAILABLE = False
+
+from pypaimon.common.options import Options
+from pypaimon.common.options.config import OssOptions
+from pypaimon.filesystem import oss_user_agent
+
+
+_JINDO_CONFIG_PREFIXES = ("fs.", "logger.")
+_PYPAIMON_ONLY_JINDO_CONFIG_KEYS = {
+    OssOptions.OSS_IMPL.key(), OssOptions.OSS_PYTHON_IMPL.key(),
+    OssOptions.OSS_JINDO_PREAD_MAX_SIZE.key()}
+_DEFAULT_PREAD_MAX_SIZE = OssOptions.OSS_JINDO_PREAD_MAX_SIZE.default_value().get_bytes()
+# Forward skips up to Jindo's read-ahead buffer stay on the stream, which likely holds them.
+_STREAM_FORWARD_SKIP = 1024 * 1024
+_CASE_SENSITIVE_JINDO_CONFIG_KEYS = {
+    OssOptions.OSS_ACCESS_KEY_ID.key().lower(): OssOptions.OSS_ACCESS_KEY_ID.key(),
+    OssOptions.OSS_ACCESS_KEY_SECRET.key().lower(): OssOptions.OSS_ACCESS_KEY_SECRET.key(),
+    OssOptions.OSS_SECURITY_TOKEN.key().lower(): OssOptions.OSS_SECURITY_TOKEN.key(),
+}
+_KNOWN_FILE_SIZE_CACHE_MAX_ENTRIES = 4096
+
+_LOG = logging.getLogger(__name__)
+
+
+class _StreamStats:
+    """Counts open streams of JindoFileSystemHandler, not those PVFS opens through pyjindo.ossfs."""
+
+    # Reentrant: garbage collection may finalize a stream while this thread holds it.
+    _lock = threading.RLock()
+    _pid = os.getpid()
+    open = 0
+    milestone = 256
+
+    @classmethod
+    def _get_lock(cls):
+        # A parent thread may hold the lock across a fork, so a child takes a new one.
+        if cls._pid != os.getpid():
+            cls._lock, cls._pid = threading.RLock(), os.getpid()
+        return cls._lock
+
+    @classmethod
+    def opened(cls):
+        with cls._get_lock():
+            cls.open += 1
+            count = cls.open
+            report = count >= cls.milestone
+            if report:
+                cls.milestone *= 2
+        if report:
+            _LOG.info("%d streams of JindoFileSystemHandler are open; each holds native buffers until closed",
+                      count)
+
+    @classmethod
+    def closed(cls):
+        with cls._get_lock():
+            cls.open -= 1
+
+
+def _jindo_config_value(value) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def build_jindo_config(catalog_options: Options):
+    """Build a pyjindo ``Config`` from catalog options."""
+    if not JINDO_AVAILABLE:
+        raise ImportError("Module pyjindo is not available. Please install pyjindosdk.")
+
+    # Use catalog options as the complete configuration source.
+    config = jutil.Config()
+
+    # Forward supported filesystem and logger options.
+    for raw_key, value in catalog_options.to_map().items():
+        supported_prefix = isinstance(raw_key, str)
+        supported_prefix = supported_prefix and raw_key.startswith(
+            _JINDO_CONFIG_PREFIXES)
+        if not supported_prefix or value is None:
+            continue
+        key = _CASE_SENSITIVE_JINDO_CONFIG_KEYS.get(raw_key.lower(), raw_key)
+        if key in _PYPAIMON_ONLY_JINDO_CONFIG_KEYS or key.startswith("fs.oss.cpp."):
+            # This option is handled by PyPaimon.
+            continue
+        config.set(key, _jindo_config_value(value))
+
+    access_key_id = catalog_options.get(OssOptions.OSS_ACCESS_KEY_ID)
+    access_key_secret = catalog_options.get(OssOptions.OSS_ACCESS_KEY_SECRET)
+    security_token = catalog_options.get(OssOptions.OSS_SECURITY_TOKEN)
+    endpoint = catalog_options.get(OssOptions.OSS_ENDPOINT)
+    region = catalog_options.get(OssOptions.OSS_REGION)
+
+    if access_key_id:
+        config.set("fs.oss.accessKeyId", access_key_id)
+    if access_key_secret:
+        config.set("fs.oss.accessKeySecret", access_key_secret)
+    if security_token:
+        config.set("fs.oss.securityToken", security_token)
+    if endpoint:
+        endpoint_clean = endpoint.replace('http://', '').replace('https://', '')
+        config.set("fs.oss.endpoint", endpoint_clean)
+    if region:
+        config.set("fs.oss.region", region)
+    # This backend fills the module itself, so pypaimon/<version> leads the features.
+    user_agent_module = oss_user_agent.module(catalog_options)
+    if user_agent_module:
+        config.set(oss_user_agent.USER_AGENT_MODULE, user_agent_module)
+    config.set(oss_user_agent.USER_AGENT_FEATURES, oss_user_agent.features(catalog_options))
+    user_agent_extended = oss_user_agent.extended(catalog_options)
+    if user_agent_extended:
+        config.set(oss_user_agent.USER_AGENT_EXTENDED, user_agent_extended)
+    return config
+
+
+def create_jindo_oss_filesystem(root_uri: str, catalog_options: Options):
+    """Create a Jindo OSS filesystem for ``PaimonVirtualFileSystem``."""
+    if not (JINDO_AVAILABLE and JINDO_OSSFS_AVAILABLE):
+        raise ImportError(
+            "pyjindo.ossfs is not available. Please install pyjindosdk>=6.10.4."
+        )
+
+    return jossfs.JindoOssFileSystem(
+        uri=root_uri,
+        config=build_jindo_config(catalog_options),
+        # PaimonVirtualFileSystem manages directory semantics.
+        auto_mkdir=False,
+        # PaimonVirtualFileSystem manages filesystem instances.
+        skip_instance_cache=True,
+    )
+
+
+class JindoInputFile:
+    def __init__(self, jindo_stream, file_size=None, *, owner,
+                 pread_max_size=_DEFAULT_PREAD_MAX_SIZE):
+        self._stream = jindo_stream
+        self._file_size = file_size
+        # The stream does not own its native store: pin the jindo filesystem (not the
+        # handler) so evicting the handler's FileIO from a cache cannot free it.
+        self._owner = owner
+        self._closed = False
+        # PyArrow's ReadAt is seek + read: when enabled, small reads after a long or
+        # backward jump use pread to skip the stream's read-ahead.
+        self._pread_max_size = pread_max_size
+        if pread_max_size > 0:
+            self._position = jindo_stream.tell() if hasattr(jindo_stream, 'tell') else 0
+            self._stream_position = self._position
+            self._last_read_end = None
+        _StreamStats.opened()
+
+    def __del__(self):
+        # CPython releases instance attributes in dict layout order, which is
+        # an implementation detail, not a contract. Close the native stream
+        # while ``_owner`` still pins the store so the stream's own release
+        # cannot race the store's teardown (pyjindo's JindoOssFile relies on
+        # the same guarantee via io.IOBase's finalizer).
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @property
+    def closed(self):
+        if hasattr(self._stream, 'closed'):
+            return self._stream.closed
+        return self._closed
+
+    def read(self, nbytes: int = -1):
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if self._pread_max_size <= 0:
+            if nbytes is None or nbytes < 0:
+                if self._file_size is None:
+                    return self._stream.read()
+                nbytes = max(0, self._file_size - self.tell())
+            return self._stream.read(nbytes)
+        if nbytes is None or nbytes < 0:
+            if self._file_size is None:
+                self._sync_stream()
+                return self._advance(self._stream.read())
+            nbytes = max(0, self._file_size - self._position)
+        elif self._file_size is not None:
+            nbytes = max(0, min(nbytes, self._file_size - self._position))
+        if nbytes == 0:
+            return b""
+        if self._use_pread(nbytes):
+            data = self._stream.pread(nbytes, self._position)
+            self._position += len(data)
+            self._last_read_end = self._position
+            return data
+        self._sync_stream()
+        return self._advance(self._stream.read(nbytes))
+
+    def _use_pread(self, nbytes):
+        if (self._position == self._stream_position
+                or nbytes > self._pread_max_size
+                or not hasattr(self._stream, 'pread')):
+            return False
+        if self._last_read_end is None:
+            return True
+        return not 0 <= self._position - self._last_read_end <= _STREAM_FORWARD_SKIP
+
+    def _sync_stream(self):
+        if self._stream_position != self._position:
+            self._stream.seek(self._position, os.SEEK_SET)
+            self._stream_position = self._position
+
+    def _advance(self, data):
+        self._position += len(data)
+        self._stream_position = self._position
+        self._last_read_end = self._position
+        return data
+
+    def seek(self, position: int, whence: int = 0):
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if whence == os.SEEK_END and self._file_size is not None:
+            position = self._file_size + position
+            whence = os.SEEK_SET
+        if self._pread_max_size <= 0:
+            self._stream.seek(position, whence)
+            return self._stream.tell()
+        if whence == os.SEEK_CUR:
+            position = self._position + position
+        elif whence == os.SEEK_END:
+            # Size unknown: let the native stream resolve SEEK_END.
+            self._stream.seek(position, whence)
+            self._stream_position = self._stream.tell()
+            position = self._stream_position
+        elif whence != os.SEEK_SET:
+            raise ValueError("Invalid whence: {}".format(whence))
+        if position < 0:
+            raise ValueError("Negative seek position {}".format(position))
+        self._position = position
+        return self._position
+
+    def tell(self) -> int:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if self._pread_max_size <= 0:
+            return self._stream.tell()
+        return self._position
+
+    def read_at(self, nbytes: int, offset: int):
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        return self._stream.pread(nbytes, offset)
+
+    def close(self):
+        if not self._closed:
+            self._stream.close()
+            self._closed = True
+            # The native stream is closed: a file object that stays
+            # referenced no longer needs to pin the native store.
+            self._owner = None
+            _StreamStats.closed()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+
+class JindoOutputFile:
+    def __init__(self, jindo_stream, *, owner):
+        self._stream = jindo_stream
+        # See JindoInputFile._owner: keep the native store alive while this
+        # stream is open.
+        self._owner = owner
+        self._closed = False
+        _StreamStats.opened()
+
+    def __del__(self):
+        # See JindoInputFile.__del__: close while ``_owner`` still pins the
+        # store. For output streams this also flushes pending writes.
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @property
+    def closed(self):
+        if hasattr(self._stream, 'closed'):
+            return self._stream.closed
+        return self._closed
+
+    def write(self, data: bytes) -> int:
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if isinstance(data, pa.Buffer):
+            data = data.to_pybytes()
+        elif not isinstance(data, bytes):
+            raise TypeError("Unsupported data type")
+        return self._stream.write(data)
+
+    def flush(self):
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        if hasattr(self._stream, 'flush'):
+            self._stream.flush()
+
+    def close(self):
+        if not self._closed:
+            self._stream.close()
+            self._closed = True
+            # The native stream is closed: a file object that stays
+            # referenced no longer needs to pin the native store.
+            self._owner = None
+            _StreamStats.closed()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+
+class JindoFileSystemHandler(FileSystemHandler):
+    def __init__(self, root_path: str, catalog_options: Options):
+        if not JINDO_AVAILABLE:
+            raise ImportError("Module pyjindo is not available. Please install pyjindosdk.")
+
+        self.logger = logging.getLogger(__name__)
+        self.root_path = root_path
+        self.properties = catalog_options
+        self._known_file_sizes = OrderedDict()
+        self._known_file_sizes_lock = threading.Lock()
+        self._pread_max_size = catalog_options.get(
+            OssOptions.OSS_JINDO_PREAD_MAX_SIZE).get_bytes()
+
+        config = build_jindo_config(catalog_options)
+        self._jindo_fs = jfs.connect(self.root_path, "root", config)
+
+    def __getstate__(self):
+        # Native clients and thread locks belong to this process. Transport only
+        # connection configuration; immutable-file size hints can be refilled.
+        return {"root_path": self.root_path, "properties": self.properties}
+
+    def __setstate__(self, state):
+        self.__init__(state["root_path"], state["properties"])
+
+    def register_file_size(self, path: str, file_size: int):
+        """Register an immutable file's size supplied by Paimon metadata."""
+        normalized = self._normalize_path(path)
+        with self._known_file_sizes_lock:
+            self._known_file_sizes[normalized] = file_size
+            self._known_file_sizes.move_to_end(normalized)
+            while (len(self._known_file_sizes)
+                   > _KNOWN_FILE_SIZE_CACHE_MAX_ENTRIES):
+                self._known_file_sizes.popitem(last=False)
+
+    def _known_file_size(self, path: str):
+        with self._known_file_sizes_lock:
+            file_size = self._known_file_sizes.get(path)
+            if file_size is not None:
+                self._known_file_sizes.move_to_end(path)
+            return file_size
+
+    def __eq__(self, other):
+        if isinstance(other, JindoFileSystemHandler):
+            return self.root_path == other.root_path
+        return NotImplemented
+
+    def __ne__(self, other):
+        if isinstance(other, JindoFileSystemHandler):
+            return not self.__eq__(other)
+        return NotImplemented
+
+    def _normalize_path(self, path: str) -> str:
+        if path.startswith('oss://'):
+            return path
+
+        if not path or path == '.':
+            return self.root_path.rstrip('/') + '/'
+
+        path_clean = path.lstrip('/')
+        return self.root_path.rstrip('/') + '/' + path_clean
+
+    def _convert_file_type(self, jindo_type) -> FileType:
+        if jindo_type == jfs.FileType.File:
+            return FileType.File
+        elif jindo_type == jfs.FileType.Directory:
+            return FileType.Directory
+        else:
+            return FileType.Unknown
+
+    def _convert_file_info(self, jindo_info) -> FileInfo:
+        pa_type = self._convert_file_type(jindo_info.type)
+        return FileInfo(
+            path=jindo_info.path,
+            type=pa_type,
+            size=jindo_info.size if jindo_info.type == jfs.FileType.File else None,
+            mtime=jindo_info.mtime if hasattr(jindo_info, 'mtime') else None,
+        )
+
+    def get_type_name(self) -> str:
+        return "jindo"
+
+    def get_file_info(self, paths) -> list:
+        infos = []
+        for path in paths:
+            normalized = self._normalize_path(path)
+            try:
+                jindo_info = self._jindo_fs.get_file_info(normalized)
+                infos.append(self._convert_file_info(jindo_info))
+            except FileNotFoundError:
+                infos.append(FileInfo(normalized, FileType.NotFound))
+        return infos
+
+    def get_file_info_selector(self, selector: FileSelector) -> list:
+        normalized = self._normalize_path(selector.base_dir)
+        try:
+            items = self._jindo_fs.listdir(normalized, recursive=selector.recursive)
+            return [self._convert_file_info(item) for item in items]
+        except FileNotFoundError:
+            if selector.allow_not_found:
+                return []
+            raise
+
+    def create_dir(self, path: str, recursive: bool):
+        normalized = self._normalize_path(path)
+        self._jindo_fs.mkdir(normalized)
+
+    def delete_dir(self, path: str):
+        normalized = self._normalize_path(path)
+        self._jindo_fs.remove(normalized)
+
+    def delete_dir_contents(self, path: str, missing_dir_ok: bool = False):
+        normalized = self._normalize_path(path)
+        if normalized == self.root_path:
+            raise ValueError(
+                "delete_dir_contents() does not accept root path"
+            )
+        self._delete_dir_contents(path, missing_dir_ok)
+
+    def delete_root_dir_contents(self):
+        self._delete_dir_contents("/", missing_dir_ok=False)
+
+    def _delete_dir_contents(self, path: str, missing_dir_ok: bool):
+        normalized = self._normalize_path(path)
+        try:
+            items = self._jindo_fs.listdir(normalized, recursive=False)
+        except FileNotFoundError:
+            if missing_dir_ok:
+                return
+            raise
+        except Exception as e:
+            self.logger.warning(f"Error listing {path}: {e}")
+            raise
+        for item in items:
+            self._jindo_fs.remove(item.path)
+
+    def delete_file(self, path: str):
+        normalized = self._normalize_path(path)
+        self._jindo_fs.remove(normalized)
+
+    def move(self, src: str, dest: str):
+        src_norm = self._normalize_path(src)
+        dst_norm = self._normalize_path(dest)
+        self._jindo_fs.rename(src_norm, dst_norm)
+
+    def copy_file(self, src: str, dest: str):
+        src_norm = self._normalize_path(src)
+        dst_norm = self._normalize_path(dest)
+        self._jindo_fs.copy_file(src_norm, dst_norm)
+
+    def open_input_stream(self, path: str):
+        normalized = self._normalize_path(path)
+        jindo_stream = self._jindo_fs.open(normalized, "rb")
+        return PythonFile(
+            JindoInputFile(jindo_stream, self._known_file_size(normalized),
+                           owner=self._jindo_fs, pread_max_size=self._pread_max_size),
+            mode="r")
+
+    def open_input_file(self, path: str):
+        normalized = self._normalize_path(path)
+        jindo_stream = self._jindo_fs.open(normalized, "rb")
+        return PythonFile(
+            JindoInputFile(jindo_stream, self._known_file_size(normalized),
+                           owner=self._jindo_fs, pread_max_size=self._pread_max_size),
+            mode="r")
+
+    def open_output_stream(self, path: str, metadata):
+        normalized = self._normalize_path(path)
+        jindo_stream = self._jindo_fs.open(normalized, "wb")
+        return PythonFile(JindoOutputFile(jindo_stream, owner=self._jindo_fs), mode="w")
+
+    def open_append_stream(self, path: str, metadata):
+        raise IOError("append mode is not supported")
+
+    def normalize_path(self, path: str) -> str:
+        return self._normalize_path(path)

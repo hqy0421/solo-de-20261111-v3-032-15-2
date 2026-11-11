@@ -1,0 +1,46 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+class TableRollback:
+    """Rollback table to instant by delegating to catalog.rollback_to."""
+
+    def __init__(self, catalog, identifier, table_uuid=None):
+        self._catalog = catalog
+        self._identifier = identifier
+        self._table_uuid = table_uuid
+
+    def rollback_to(self, instant, from_snapshot=None):
+        """Rollback table to the given instant via catalog.
+
+        Args:
+            instant: The Instant (SnapshotInstant or TagInstant) to rollback to.
+            from_snapshot: Optional snapshot ID. Success only occurs when the
+                latest snapshot is this snapshot.
+
+        Raises:
+            RuntimeError: If the rollback fails.
+        """
+        try:
+            if self._table_uuid is None:
+                self._catalog.rollback_to(self._identifier, instant, from_snapshot)
+            else:
+                self._catalog.rollback_to(
+                    self._identifier, instant, from_snapshot, table_uuid=self._table_uuid)
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to rollback table {}: {}".format(
+                    self._identifier, e)) from e

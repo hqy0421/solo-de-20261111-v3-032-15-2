@@ -1,0 +1,961 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.paimon.operation;
+
+import org.apache.paimon.CoreOptions;
+import org.apache.paimon.Snapshot;
+import org.apache.paimon.catalog.Catalog;
+import org.apache.paimon.data.BinaryRow;
+import org.apache.paimon.data.BinaryString;
+import org.apache.paimon.data.GenericRow;
+import org.apache.paimon.data.serializer.InternalRowSerializer;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.fs.local.LocalFileIO;
+import org.apache.paimon.io.CompactIncrement;
+import org.apache.paimon.io.DataFileMeta;
+import org.apache.paimon.io.DataIncrement;
+import org.apache.paimon.manifest.PartitionEntry;
+import org.apache.paimon.options.Options;
+import org.apache.paimon.partition.PartitionExpireStrategy;
+import org.apache.paimon.partition.PartitionStatistics;
+import org.apache.paimon.partition.PartitionUpdateTimeExpireStrategy;
+import org.apache.paimon.partition.PartitionValuesTimeExpireStrategy;
+import org.apache.paimon.partition.actions.AddDonePartitionAction;
+import org.apache.paimon.schema.FileSystemSchemaManager;
+import org.apache.paimon.schema.Schema;
+import org.apache.paimon.schema.SchemaManager;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.CatalogEnvironment;
+import org.apache.paimon.table.FileStoreTable;
+import org.apache.paimon.table.FileStoreTableFactory;
+import org.apache.paimon.table.PartitionModification;
+import org.apache.paimon.table.sink.BatchWriteBuilder;
+import org.apache.paimon.table.sink.CommitMessage;
+import org.apache.paimon.table.sink.CommitMessageImpl;
+import org.apache.paimon.table.sink.StreamTableCommit;
+import org.apache.paimon.table.sink.StreamTableWrite;
+import org.apache.paimon.table.sink.TableCommitImpl;
+import org.apache.paimon.types.DataType;
+import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.types.RowType;
+import org.apache.paimon.types.VarCharType;
+import org.apache.paimon.utils.SnapshotManager;
+
+import org.apache.paimon.shade.guava30.com.google.common.collect.Streams;
+
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.io.IOException;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
+
+import static java.util.Collections.emptyList;
+import static java.util.Collections.singletonList;
+import static org.apache.paimon.CoreOptions.METASTORE_PARTITIONED_TABLE;
+import static org.apache.paimon.CoreOptions.PARTITION_EXPIRATION_CHECK_INTERVAL;
+import static org.apache.paimon.CoreOptions.PARTITION_EXPIRATION_RETAIN_LATEST;
+import static org.apache.paimon.CoreOptions.PARTITION_EXPIRATION_TIME;
+import static org.apache.paimon.CoreOptions.PARTITION_TIMESTAMP_FORMATTER;
+import static org.apache.paimon.CoreOptions.PATH;
+import static org.apache.paimon.CoreOptions.WRITE_ONLY;
+import static org.apache.paimon.CoreOptions.createCommitUser;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.entry;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/** Test for {@link NormalPartitionExpire}. */
+public class PartitionExpireTest {
+
+    @TempDir java.nio.file.Path tempDir;
+
+    private Path path;
+    private FileStoreTable table;
+    private Set<Map<String, String>> createdPartitions;
+    private List<Map<String, String>> deletedPartitions;
+
+    @BeforeEach
+    public void beforeEach() {
+        path = new Path(tempDir.toUri());
+    }
+
+    private void newTable() {
+        LocalFileIO fileIO = LocalFileIO.create();
+        Options options = new Options();
+        options.set(PATH, path.toString());
+        Path tablePath = CoreOptions.path(options);
+        String branchName = CoreOptions.branch(options.toMap());
+        TableSchema tableSchema =
+                new FileSystemSchemaManager(fileIO, tablePath, branchName).latest().get();
+        createdPartitions = new HashSet<>();
+        deletedPartitions = new ArrayList<>();
+        PartitionModification partitionModification =
+                new PartitionModification() {
+                    @Override
+                    public void createPartitions(List<Map<String, String>> partitions)
+                            throws Catalog.TableNotExistException {
+                        createdPartitions.addAll(partitions);
+                    }
+
+                    @Override
+                    public void dropPartitions(List<Map<String, String>> partitions)
+                            throws Catalog.TableNotExistException {
+                        dropPartitionMetadata(partitions);
+                        try (FileStoreCommit commit =
+                                table.store()
+                                        .newCommit(
+                                                createCommitUser(
+                                                        table.coreOptions().toConfiguration()),
+                                                null)) {
+                            commit.dropPartitions(partitions, BatchWriteBuilder.COMMIT_IDENTIFIER);
+                        }
+                        // Model HiveCatalog's cleanup of markers after deleting ordinary data.
+                        List<Map<String, String>> donePartitions = new ArrayList<>();
+                        String lastKey =
+                                tableSchema
+                                        .partitionKeys()
+                                        .get(tableSchema.partitionKeys().size() - 1);
+                        for (Map<String, String> partition : partitions) {
+                            Map<String, String> donePartition = new HashMap<>(partition);
+                            donePartition.put(lastKey, partition.get(lastKey) + ".done");
+                            donePartitions.add(donePartition);
+                        }
+                        dropPartitionMetadata(donePartitions);
+                    }
+
+                    private void dropPartitionMetadata(List<Map<String, String>> partitions) {
+                        for (Map<String, String> partition : partitions) {
+                            // only record partitions that were created
+                            if (createdPartitions.remove(partition)) {
+                                deletedPartitions.add(partition);
+                            }
+                        }
+                    }
+
+                    @Override
+                    public void alterPartitions(List<PartitionStatistics> partitions)
+                            throws Catalog.TableNotExistException {}
+
+                    @Override
+                    public void close() throws Exception {}
+                };
+
+        CatalogEnvironment env =
+                new CatalogEnvironment(null, null, null, null, null, null, false, false) {
+
+                    @Override
+                    public PartitionModification partitionModification() {
+                        return partitionModification;
+                    }
+                };
+        table = FileStoreTableFactory.create(fileIO, path, tableSchema, env);
+    }
+
+    @Test
+    public void testNonPartitionedTable() {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        assertThatCode(
+                        () ->
+                                schemaManager.createTable(
+                                        new Schema(
+                                                RowType.of(VarCharType.STRING_TYPE).getFields(),
+                                                emptyList(),
+                                                emptyList(),
+                                                Collections.singletonMap(
+                                                        PARTITION_EXPIRATION_TIME.key(), "1 d"),
+                                                "")))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    public void testIllegalPartition() throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE).getFields(),
+                        singletonList("f0"),
+                        emptyList(),
+                        Collections.emptyMap(),
+                        ""));
+        newTable();
+        write("20230101", "11");
+        write("abcd", "12");
+        write("20230101", "12");
+        write("20230103", "31");
+        write("20230103", "32");
+        write("20230105", "51");
+        NormalPartitionExpire expire = newExpire();
+        expire.setLastCheck(date(1));
+        Assertions.assertDoesNotThrow(() -> expire.expire(date(8), Long.MAX_VALUE));
+        assertThat(read()).containsExactlyInAnyOrder("abcd:12");
+    }
+
+    @Test
+    public void testBatchExpire() throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE).getFields(),
+                        singletonList("f0"),
+                        emptyList(),
+                        Collections.emptyMap(),
+                        ""));
+        newTable();
+        table =
+                table.copy(
+                        Collections.singletonMap(
+                                CoreOptions.PARTITION_EXPIRATION_BATCH_SIZE.key(), "1"));
+        write("20230101", "11");
+        write("20230101", "12");
+        write("20230103", "31");
+        write("20230103", "32");
+        write("20230105", "51");
+        NormalPartitionExpire expire = newExpire();
+        expire.setLastCheck(date(1));
+        Assertions.assertDoesNotThrow(() -> expire.expire(date(8), Long.MAX_VALUE));
+
+        long overwriteSnapshotCnt =
+                Streams.stream(table.snapshotManager().snapshots())
+                        .filter(snapshot -> snapshot.commitKind() == Snapshot.CommitKind.OVERWRITE)
+                        .count();
+        assertThat(overwriteSnapshotCnt).isEqualTo(3L);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1969-12-31", "1970-01-01", "2024-02-29", "2026-03-11"})
+    public void testDatePartitionValues(String dateValue) {
+        LocalDate partitionDate = LocalDate.parse(dateValue);
+        RowType partitionType = RowType.of(new DataType[] {DataTypes.DATE()}, new String[] {"dt"});
+        BinaryRow partition = BinaryRow.singleColumn((int) partitionDate.toEpochDay());
+        for (String formatter : Arrays.asList(null, "yyyy-MM-dd")) {
+            for (String pattern : Arrays.asList(null, "$dt")) {
+                Options options = new Options();
+                if (formatter != null) {
+                    options.set(PARTITION_TIMESTAMP_FORMATTER, formatter);
+                }
+                if (pattern != null) {
+                    options.set(CoreOptions.PARTITION_TIMESTAMP_PATTERN, pattern);
+                }
+                PartitionValuesTimeExpireStrategy strategy =
+                        new PartitionValuesTimeExpireStrategy(
+                                new CoreOptions(options), partitionType);
+                Object[] values = strategy.convertPartition(partition);
+                assertThat(strategy.toPartitionValue(values)).containsExactly(dateValue);
+                assertThat(strategy.toPartitionString(values))
+                        .containsExactly(entry("dt", dateValue));
+                assertThat(strategy.isExpired(partitionDate.plusDays(1).atStartOfDay(), partition))
+                        .isTrue();
+                assertThat(strategy.isExpired(partitionDate.atStartOfDay(), partition)).isFalse();
+            }
+        }
+    }
+
+    @Test
+    public void testNullDatePartitionValues() {
+        RowType partitionType = RowType.of(DataTypes.DATE());
+        BinaryRow partition =
+                new InternalRowSerializer(partitionType).toBinaryRow(GenericRow.of((Object) null));
+        CoreOptions options = new CoreOptions(new Options());
+        PartitionValuesTimeExpireStrategy strategy =
+                new PartitionValuesTimeExpireStrategy(options, partitionType);
+        assertThat(strategy.toPartitionValue(strategy.convertPartition(partition)))
+                .containsExactly(options.partitionDefaultName());
+        assertThat(strategy.isExpired(date(6), partition)).isFalse();
+    }
+
+    @Test
+    public void testIntegerPartitionValues() {
+        Options options = new Options();
+        options.set(PARTITION_TIMESTAMP_FORMATTER, "yyyyMMdd");
+        PartitionValuesTimeExpireStrategy strategy =
+                new PartitionValuesTimeExpireStrategy(
+                        new CoreOptions(options), RowType.of(DataTypes.INT()));
+        BinaryRow partition = BinaryRow.singleColumn(20230101);
+        assertThat(strategy.convertPartition(partition)).containsExactly(20230101);
+        assertThat(strategy.toPartitionValue(strategy.convertPartition(partition)))
+                .containsExactly("20230101");
+        assertThat(strategy.isExpired(date(6), partition)).isTrue();
+    }
+
+    @Test
+    public void testDateAndHourPartitionValues() {
+        RowType partitionType =
+                RowType.of(
+                        new DataType[] {DataTypes.DATE(), DataTypes.INT()},
+                        new String[] {"dt", "hour"});
+        LocalDate partitionDate = LocalDate.of(2023, 1, 1);
+        BinaryRow partition =
+                new InternalRowSerializer(partitionType)
+                        .toBinaryRow(GenericRow.of((int) partitionDate.toEpochDay(), 12));
+        Options options = new Options();
+        options.set(CoreOptions.PARTITION_TIMESTAMP_PATTERN, "$dt $hour:00:00");
+        options.set(PARTITION_TIMESTAMP_FORMATTER, "yyyy-MM-dd HH:mm:ss");
+        PartitionValuesTimeExpireStrategy strategy =
+                new PartitionValuesTimeExpireStrategy(new CoreOptions(options), partitionType);
+        assertThat(strategy.toPartitionValue(strategy.convertPartition(partition)))
+                .containsExactly("2023-01-01", "12");
+        assertThat(strategy.isExpired(partitionDate.atTime(12, 0), partition)).isFalse();
+        assertThat(strategy.isExpired(partitionDate.atTime(13, 0), partition)).isTrue();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"values-time", "update-time"})
+    public void testExpireDatePartitionWithoutMetastore(String expirationStrategy)
+            throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        Map<String, String> tableOptions = new HashMap<>();
+        tableOptions.put(METASTORE_PARTITIONED_TABLE.key(), "false");
+        tableOptions.put(CoreOptions.PARTITION_GENERATE_LEGACY_NAME.key(), "false");
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(DataTypes.DATE(), VarCharType.STRING_TYPE).getFields(),
+                        singletonList("f0"),
+                        emptyList(),
+                        tableOptions,
+                        ""));
+        newTable();
+        int expiredDay = (int) date(1).toLocalDate().toEpochDay();
+        int retainedDay = (int) date(5).toLocalDate().toEpochDay();
+        write(GenericRow.of(expiredDay, BinaryString.fromString("expired")));
+        write(GenericRow.of(retainedDay, BinaryString.fromString("retained")));
+
+        Map<String, String> options = new HashMap<>();
+        options.put(PARTITION_EXPIRATION_TIME.key(), "2 d");
+        options.put(CoreOptions.PARTITION_EXPIRATION_STRATEGY.key(), expirationStrategy);
+        options.put(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyy-MM-dd");
+        options.put(CoreOptions.PARTITION_TIMESTAMP_PATTERN.key(), "$f0");
+        table = table.copy(options);
+        NormalPartitionExpire expire =
+                (NormalPartitionExpire) table.store().newPartitionExpire("", table);
+        expire.setLastCheck(date(1));
+        List<Map<String, String>> expectedExpired = new ArrayList<>();
+        expectedExpired.add(Collections.singletonMap("f0", "2023-01-01"));
+        LocalDateTime checkTime = date(6);
+        List<Integer> expectedRemaining = singletonList(retainedDay);
+        if ("update-time".equals(expirationStrategy)) {
+            checkTime = LocalDateTime.now().plusDays(3);
+            expectedExpired.add(Collections.singletonMap("f0", "2023-01-05"));
+            expectedRemaining = emptyList();
+        }
+        assertThat(expire.expire(checkTime, Long.MAX_VALUE))
+                .containsExactlyElementsOf(expectedExpired);
+        List<Integer> remainingDates = new ArrayList<>();
+        table.newRead()
+                .createReader(table.newScan().plan().splits())
+                .forEachRemaining(row -> remainingDates.add(row.getInt(0)));
+        assertThat(remainingDates).containsExactlyElementsOf(expectedRemaining);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"update-time", "values-time"})
+    public void testExpireDefaultLegacyDateAndStringPartitionMetadata(String expirationStrategy)
+            throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(
+                                        DataTypes.DATE(),
+                                        VarCharType.STRING_TYPE,
+                                        VarCharType.STRING_TYPE)
+                                .getFields(),
+                        Arrays.asList("f0", "f1"),
+                        emptyList(),
+                        Collections.singletonMap(METASTORE_PARTITIONED_TABLE.key(), "true"),
+                        ""));
+        newTable();
+        assertThat(table.coreOptions().legacyPartitionName()).isTrue();
+        int epochDay = (int) date(1).toLocalDate().toEpochDay();
+        write(
+                GenericRow.of(
+                        epochDay,
+                        BinaryString.fromString("west"),
+                        BinaryString.fromString("expired")));
+        Map<String, String> expectedPartition = new LinkedHashMap<>();
+        expectedPartition.put("f0", Integer.toString(epochDay));
+        expectedPartition.put("f1", "west");
+        assertThat(createdPartitions).containsExactly(expectedPartition);
+
+        Map<String, String> options = new HashMap<>();
+        options.put(PARTITION_EXPIRATION_TIME.key(), "2 d");
+        options.put(CoreOptions.PARTITION_EXPIRATION_STRATEGY.key(), expirationStrategy);
+        options.put(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyy-MM-dd");
+        options.put(CoreOptions.PARTITION_TIMESTAMP_PATTERN.key(), "$f0");
+        table = table.copy(options);
+        NormalPartitionExpire expire =
+                (NormalPartitionExpire) table.store().newPartitionExpire("", table);
+        expire.setLastCheck(date(1));
+        LocalDateTime checkTime =
+                "update-time".equals(expirationStrategy)
+                        ? LocalDateTime.now().plusDays(3)
+                        : date(6);
+        List<Map<String, String>> expired = expire.expire(checkTime, Long.MAX_VALUE);
+
+        List<String> remaining = new ArrayList<>();
+        table.newRead()
+                .createReader(table.newScan().plan().splits())
+                .forEachRemaining(row -> remaining.add(row.getString(2).toString()));
+        assertThat(remaining).isEmpty();
+        assertThat(createdPartitions).isEmpty();
+        assertThat(deletedPartitions).containsExactly(expectedPartition);
+        assertThat(expired).containsExactly(expectedPartition);
+    }
+
+    @Test
+    public void testExpireWithNullOrEmptyPartition() throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE).getFields(),
+                        Arrays.asList("f0", "f1"),
+                        emptyList(),
+                        Collections.singletonMap(METASTORE_PARTITIONED_TABLE.key(), "true"),
+                        ""));
+        newTable();
+        write("20230101", "11");
+        write("20230101", "12");
+        // sub partition is null
+        write("20230101", null);
+        // sub partition is empty string
+        write("20230103", "");
+        write("20230103", "32");
+        write("20230105", "51");
+
+        NormalPartitionExpire expire = newExpire();
+        expire.setLastCheck(date(1));
+        Assertions.assertDoesNotThrow(() -> expire.expire(date(6), Long.MAX_VALUE));
+
+        // null partition and empty string partition should be expired
+        assertThat(read()).containsExactlyInAnyOrder("20230105:51");
+    }
+
+    @Test
+    public void test() throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE).getFields(),
+                        singletonList("f0"),
+                        emptyList(),
+                        Collections.singletonMap(METASTORE_PARTITIONED_TABLE.key(), "true"),
+                        ""));
+        newTable();
+
+        write("20230101", "11");
+        write("20230101", "12");
+        write("20230103", "31");
+        write("20230103", "32");
+        write("20230105", "51");
+
+        NormalPartitionExpire expire = newExpire();
+        expire.setLastCheck(date(1));
+
+        expire.expire(date(3), Long.MAX_VALUE);
+        assertThat(read())
+                .containsExactlyInAnyOrder(
+                        "20230101:11", "20230101:12", "20230103:31", "20230103:32", "20230105:51");
+
+        expire.expire(date(5), Long.MAX_VALUE);
+        assertThat(read()).containsExactlyInAnyOrder("20230103:31", "20230103:32", "20230105:51");
+
+        // PARTITION_EXPIRATION_INTERVAL not trigger
+        expire.expire(date(6), Long.MAX_VALUE);
+        assertThat(read()).containsExactlyInAnyOrder("20230103:31", "20230103:32", "20230105:51");
+
+        expire.expire(date(8), Long.MAX_VALUE);
+        assertThat(read()).isEmpty();
+
+        assertThat(deletedPartitions)
+                .containsExactlyInAnyOrder(
+                        new LinkedHashMap<>(Collections.singletonMap("f0", "20230101")),
+                        new LinkedHashMap<>(Collections.singletonMap("f0", "20230103")),
+                        new LinkedHashMap<>(Collections.singletonMap("f0", "20230105")));
+    }
+
+    @Test
+    public void testDonePartitionExpire() throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE).getFields(),
+                        singletonList("f0"),
+                        emptyList(),
+                        Collections.singletonMap(METASTORE_PARTITIONED_TABLE.key(), "true"),
+                        ""));
+        newTable();
+
+        write("20230101", "11");
+        write("20230103", "31");
+        write("20230108", "81");
+
+        AddDonePartitionAction doneAction =
+                new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+        doneAction.markDone("f0=20230101");
+        doneAction.markDone("f0=20230103");
+        doneAction.markDone("f0=20230108");
+
+        NormalPartitionExpire expire = newExpire();
+        expire.setLastCheck(date(1));
+        expire.expire(date(8), Long.MAX_VALUE);
+
+        assertThat(deletedPartitions)
+                .containsExactlyInAnyOrder(
+                        new LinkedHashMap<>(Collections.singletonMap("f0", "20230101")),
+                        new LinkedHashMap<>(Collections.singletonMap("f0", "20230103")),
+                        new LinkedHashMap<>(Collections.singletonMap("f0", "20230101.done")),
+                        new LinkedHashMap<>(Collections.singletonMap("f0", "20230103.done")));
+        assertThat(read()).containsExactlyInAnyOrder("20230108:81");
+    }
+
+    @Test
+    public void testFilterCommittedAfterExpiring() throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE).getFields(),
+                        singletonList("f0"),
+                        emptyList(),
+                        Collections.emptyMap(),
+                        ""));
+
+        newTable();
+        // disable compaction and snapshot expiration
+        table = table.copy(Collections.singletonMap(WRITE_ONLY.key(), "true"));
+        String commitUser = UUID.randomUUID().toString();
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+
+        // prepare commits
+        LocalDate now = LocalDate.now();
+        int preparedCommits = random.nextInt(20, 30);
+
+        List<List<CommitMessage>> commitMessages = new ArrayList<>();
+        for (int i = 0; i < preparedCommits; i++) {
+            // ensure the partition will be expired
+            String f0 =
+                    now.minus(random.nextInt(10), ChronoUnit.DAYS)
+                            .format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+            String f1 = String.valueOf(random.nextInt(25));
+            StreamTableWrite write = table.newWrite(commitUser);
+            write.write(GenericRow.of(BinaryString.fromString(f0), BinaryString.fromString(f1)));
+            commitMessages.add(write.prepareCommit(false, i));
+        }
+
+        // commit a part of data and trigger partition expire
+        int successCommits = random.nextInt(preparedCommits / 4, preparedCommits / 2);
+        StreamTableCommit commit = table.newCommit(commitUser);
+        for (int i = 0; i < successCommits - 2; i++) {
+            commit.commit(i, commitMessages.get(i));
+        }
+
+        // we need two commits to trigger partition expire
+        // the first commit will set the last check time to now
+        // the second commit will do the partition expire
+        Map<String, String> options = new HashMap<>();
+        options.put(WRITE_ONLY.key(), "false");
+        options.put(PARTITION_EXPIRATION_TIME.key(), "1 d");
+        options.put(PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "5 s");
+        options.put(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd");
+        table = table.copy(options);
+        commit.close();
+        commit = table.newCommit(commitUser);
+        commit.commit(successCommits - 2, commitMessages.get(successCommits - 2));
+        Thread.sleep(5000);
+        commit.commit(successCommits - 1, commitMessages.get(successCommits - 1));
+
+        // check whether partition expire is triggered
+        SnapshotManager snapshotManager = table.snapshotManager();
+        Snapshot snapshot = snapshotManager.latestSnapshot();
+        assertThat(snapshot.commitKind()).isEqualTo(Snapshot.CommitKind.OVERWRITE);
+
+        // filterAndCommit
+        Map<Long, List<CommitMessage>> allCommits = new HashMap<>();
+        for (int i = 0; i < preparedCommits; i++) {
+            allCommits.put((long) i, commitMessages.get(i));
+        }
+
+        // no exception here
+        commit.filterAndCommit(allCommits);
+        commit.close();
+
+        // check commit last
+        assertThat(snapshotManager.latestSnapshot().commitIdentifier())
+                .isEqualTo(allCommits.size() - 1);
+    }
+
+    @Test
+    public void testDeleteExpiredPartition() throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE).getFields(),
+                        singletonList("f0"),
+                        emptyList(),
+                        Collections.emptyMap(),
+                        ""));
+        newTable();
+        table = newExpireTable();
+
+        List<CommitMessage> commitMessages = write("20230101", "11");
+        write("20230105", "51");
+
+        NormalPartitionExpire expire = newExpire();
+        expire.setLastCheck(date(1));
+        expire.expire(date(5), Long.MAX_VALUE);
+        assertThat(read()).containsExactlyInAnyOrder("20230105:51");
+
+        TableCommitImpl commit = table.newCommit("");
+        CommitMessageImpl message = (CommitMessageImpl) commitMessages.get(0);
+        DataFileMeta file = message.newFilesIncrement().newFiles().get(0);
+        CommitMessageImpl newMessage =
+                new CommitMessageImpl(
+                        message.partition(),
+                        message.bucket(),
+                        message.totalBuckets(),
+                        new DataIncrement(emptyList(), emptyList(), emptyList()),
+                        new CompactIncrement(singletonList(file), emptyList(), emptyList()));
+
+        assertThatThrownBy(() -> commit.commit(0L, singletonList(newMessage)))
+                .hasMessage(
+                        "You are writing data to expired partitions, and you can filter "
+                                + "this data to avoid job failover. Otherwise, continuous expired records will cause the"
+                                + " job to failover restart continuously. Expired partitions are: [20230101]");
+    }
+
+    @Test
+    public void testExpirePartitionValueContainingTheDelimiter() throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE).getFields(),
+                        Arrays.asList("f0", "f1"),
+                        emptyList(),
+                        Collections.emptyMap(),
+                        ""));
+        newTable();
+        // f1 contains the delimiter that the expired partitions are joined on
+        write("20230101", "us,ca");
+        write("20230105", "51");
+
+        NormalPartitionExpire expire = newExpire();
+        expire.setLastCheck(date(1));
+        List<Map<String, String>> expired = expire.expire(date(6), Long.MAX_VALUE);
+
+        assertThat(expired).hasSize(1);
+        assertThat(expired.get(0)).containsExactly(entry("f0", "20230101"), entry("f1", "us,ca"));
+        assertThat(read()).containsExactlyInAnyOrder("20230105:51");
+    }
+
+    @Test
+    public void testExpireKeepsALivePartitionWhoseNeighbourContainsTheDelimiter() throws Exception {
+        SchemaManager schemaManager = new FileSystemSchemaManager(LocalFileIO.create(), path);
+        schemaManager.createTable(
+                new Schema(
+                        RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE).getFields(),
+                        singletonList("f0"),
+                        emptyList(),
+                        Collections.emptyMap(),
+                        ""));
+        newTable();
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.PARTITION_EXPIRATION_STRATEGY.key(), "update-time");
+        options.put(PARTITION_EXPIRATION_TIME.key(), "1 s");
+        options.put(PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "1 d");
+        table = table.copy(options);
+
+        // "us,ca" is old enough to expire; "us" is written afterwards and must survive. Under
+        // update-time any partition value is accepted, so the delimiter reaches the round trip.
+        write("us,ca", "old");
+        Thread.sleep(2000);
+        write("us", "fresh");
+        // pin the check time now, so a later stall cannot move the cut-off past "us"
+        LocalDateTime checkTime = LocalDateTime.now();
+
+        NormalPartitionExpire expire =
+                (NormalPartitionExpire) table.store().newPartitionExpire("", table);
+        expire.setLastCheck(checkTime.minusDays(2));
+        List<Map<String, String>> expired = expire.expire(checkTime, Long.MAX_VALUE);
+
+        assertThat(expired).hasSize(1);
+        assertThat(expired.get(0)).containsExactly(entry("f0", "us,ca"));
+        assertThat(read()).containsExactlyInAnyOrder("us:fresh");
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "true,false", "false,true", "true,true"})
+    public void testRetainLatestPartitionLifecycle(boolean primaryKey, boolean metastore)
+            throws Exception {
+        newRetainLatestTable(primaryKey);
+        table =
+                table.copy(
+                        Collections.singletonMap(
+                                METASTORE_PARTITIONED_TABLE.key(), String.valueOf(metastore)));
+        NormalPartitionExpire expire =
+                (NormalPartitionExpire) table.store().newPartitionExpire("expire", table);
+        assertThat(expire.expire(date(10), Long.MAX_VALUE)).isEmpty();
+
+        write("20230101", "old");
+        assertThat(expire.expire(date(10), Long.MAX_VALUE)).isEmpty();
+        write("20230103", "latest");
+        if (metastore) {
+            AddDonePartitionAction doneAction =
+                    new AddDonePartitionAction(table.catalogEnvironment().partitionModification());
+            doneAction.markDone("f0=20230101");
+            doneAction.markDone("f0=20230103");
+        }
+        assertThat(expire.expire(date(10), Long.MAX_VALUE))
+                .containsExactly(Collections.singletonMap("f0", "20230101"));
+        assertThat(read()).containsExactly("20230103:latest");
+        long snapshotId = table.snapshotManager().latestSnapshotId();
+        assertThat(expire.expire(date(20), Long.MAX_VALUE)).isEmpty();
+        assertThat(table.snapshotManager().latestSnapshotId()).isEqualTo(snapshotId);
+        if (metastore) {
+            assertThat(createdPartitions)
+                    .containsExactlyInAnyOrder(
+                            Collections.singletonMap("f0", "20230103"),
+                            Collections.singletonMap("f0", "20230103.done"));
+            assertThat(deletedPartitions)
+                    .containsExactlyInAnyOrder(
+                            Collections.singletonMap("f0", "20230101"),
+                            Collections.singletonMap("f0", "20230101.done"));
+        }
+
+        // Prepared files are not a replacement until their commit becomes visible.
+        try (StreamTableWrite write = table.newWrite("replacement");
+                TableCommitImpl commit = table.newCommit("replacement")) {
+            write.write(
+                    GenericRow.of(
+                            BinaryString.fromString("20230121"), BinaryString.fromString("new")));
+            List<CommitMessage> messages = write.prepareCommit(true, 0);
+            assertThat(expire.expire(date(22), Long.MAX_VALUE)).isEmpty();
+            assertThat(read()).containsExactly("20230103:latest");
+            commit.commit(0, messages);
+        }
+        assertThat(expire.expire(date(22), Long.MAX_VALUE))
+                .containsExactly(Collections.singletonMap("f0", "20230103"));
+        assertThat(expire.expire(date(30), Long.MAX_VALUE)).isEmpty();
+        assertThat(read()).containsExactly("20230121:new");
+        if (metastore) {
+            assertThat(createdPartitions)
+                    .containsExactly(Collections.singletonMap("f0", "20230121"));
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1,1", "100,1", "100,0"})
+    public void testRetainLatestWithLimitsAndBatches(int limit, int batchSize) throws Exception {
+        newRetainLatestTable(false);
+        Map<String, String> options = new HashMap<>();
+        options.put(CoreOptions.PARTITION_EXPIRATION_MAX_NUM.key(), String.valueOf(limit));
+        options.put(CoreOptions.PARTITION_EXPIRATION_BATCH_SIZE.key(), String.valueOf(batchSize));
+        options.put(PARTITION_TIMESTAMP_FORMATTER.key(), "ddMMyyyy");
+        table = table.copy(options);
+        write("12012023", "old");
+        write("15012023", "old");
+        // Lexical order differs from timestamp order.
+        write("02022023", "latest");
+        NormalPartitionExpire expire =
+                (NormalPartitionExpire) table.store().newPartitionExpire("expire", table);
+        for (int i = 0; i < 4; i++) {
+            assertThat(expire.expire(LocalDateTime.of(2023, 3, 1, 0, 0), Long.MAX_VALUE))
+                    .hasSizeLessThanOrEqualTo(limit);
+        }
+        assertThat(read()).containsExactly("02022023:latest");
+    }
+
+    @Test
+    public void testRetainLatestDoesNotKeepExtraPartitionWhenUnparseablePartitionRemains()
+            throws Exception {
+        newRetainLatestTable(false);
+        write("20230101", "old");
+        write("invalid", "retained");
+        NormalPartitionExpire expire =
+                (NormalPartitionExpire) table.store().newPartitionExpire("expire", table);
+        assertThat(expire.expire(date(10), Long.MAX_VALUE)).hasSize(1);
+        assertThat(read()).containsExactly("invalid:retained");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testWriterTriggeredExpirationRetainsLatest(boolean primaryKey) throws Exception {
+        newRetainLatestTable(primaryKey);
+        table = table.copy(Collections.singletonMap(WRITE_ONLY.key(), "false"));
+        write("20230101", "old");
+        assertThat(read()).containsExactly("20230101:old");
+        write("20230103", "latest");
+        assertThat(read()).containsExactly("20230103:latest");
+    }
+
+    @Test
+    public void testRetainLatestDoesNotPreventExplicitDeletion() throws Exception {
+        newRetainLatestTable(false);
+        write("20230101", "old");
+        try (FileStoreCommit commit = table.store().newCommit("drop", table)) {
+            commit.dropPartitions(singletonList(Collections.singletonMap("f0", "20230101")), 0);
+            assertThat(read()).isEmpty();
+            write("20230103", "latest");
+            commit.truncateTable(1);
+            assertThat(read()).isEmpty();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"values-time", "update-time"})
+    public void testRetainLatestOrderingAndStableTies(String expirationStrategy) {
+        RowType type = RowType.of(DataTypes.DATE(), DataTypes.STRING());
+        Options options = new Options();
+        options.set(PARTITION_EXPIRATION_RETAIN_LATEST, true);
+        boolean updateTime = "update-time".equals(expirationStrategy);
+        PartitionExpireStrategy strategy =
+                updateTime
+                        ? new PartitionUpdateTimeExpireStrategy(new CoreOptions(options), type)
+                        : new PartitionValuesTimeExpireStrategy(new CoreOptions(options), type);
+        InternalRowSerializer serializer = new InternalRowSerializer(type);
+        // For update-time, the latest partition may have an older partition timestamp.
+        PartitionEntry old = partitionEntry(serializer, updateTime ? 5 : 1, "z", 1);
+        PartitionEntry recent = partitionEntry(serializer, 3, "a", 3);
+        PartitionEntry tie = partitionEntry(serializer, 3, "b", 3);
+        FileStoreScan scan = mock(FileStoreScan.class);
+        when(scan.readPartitionEntries()).thenReturn(Arrays.asList(old, recent, tie));
+        List<PartitionEntry> expired = strategy.selectExpiredPartitions(scan, date(10));
+        assertThat(expired).hasSize(2).contains(old);
+        when(scan.readPartitionEntries()).thenReturn(Arrays.asList(tie, recent, old));
+        assertThat(strategy.selectExpiredPartitions(scan, date(10)))
+                .containsExactlyInAnyOrderElementsOf(expired);
+        when(scan.readPartitionEntries()).thenReturn(singletonList(recent));
+        assertThat(strategy.selectExpiredPartitions(scan, date(10))).isEmpty();
+
+        // Any live partition means there is no need to protect an expired one.
+        PartitionEntry live =
+                partitionEntry(
+                        serializer,
+                        20,
+                        "live",
+                        date(20).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli());
+        when(scan.readPartitionEntries()).thenReturn(Arrays.asList(old, recent, live));
+        assertThat(strategy.selectExpiredPartitions(scan, date(10))).containsExactly(old, recent);
+        if (!updateTime) {
+            PartitionEntry nullTime = partitionEntry(serializer, null, "null", 1);
+            when(scan.readPartitionEntries()).thenReturn(Arrays.asList(old, recent, nullTime));
+            assertThat(strategy.selectExpiredPartitions(scan, date(10)))
+                    .containsExactly(old, recent);
+        }
+        when(scan.readPartitionEntries()).thenReturn(emptyList());
+        assertThat(strategy.selectExpiredPartitions(scan, date(10))).isEmpty();
+    }
+
+    private PartitionEntry partitionEntry(
+            InternalRowSerializer serializer, Integer day, String group, long fileCreationTime) {
+        BinaryRow partition =
+                serializer
+                        .toBinaryRow(
+                                GenericRow.of(
+                                        day == null
+                                                ? null
+                                                : (int) date(day).toLocalDate().toEpochDay(),
+                                        BinaryString.fromString(group)))
+                        .copy();
+        return new PartitionEntry(partition, 1, 1, 1, fileCreationTime, 1);
+    }
+
+    private void newRetainLatestTable(boolean primaryKey) throws Exception {
+        Map<String, String> options = new HashMap<>();
+        options.put(PARTITION_EXPIRATION_RETAIN_LATEST.key(), "true");
+        options.put(PARTITION_EXPIRATION_TIME.key(), "2 d");
+        options.put(PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "0 s");
+        options.put(PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd");
+        options.put(WRITE_ONLY.key(), "true");
+        if (primaryKey) {
+            options.put(CoreOptions.BUCKET.key(), "1");
+        }
+        new FileSystemSchemaManager(LocalFileIO.create(), path)
+                .createTable(
+                        new Schema(
+                                RowType.of(VarCharType.STRING_TYPE, VarCharType.STRING_TYPE)
+                                        .getFields(),
+                                singletonList("f0"),
+                                primaryKey ? Arrays.asList("f0", "f1") : emptyList(),
+                                options,
+                                ""));
+        newTable();
+    }
+
+    private List<String> read() throws IOException {
+        List<String> ret = new ArrayList<>();
+        table.newRead()
+                .createReader(table.newScan().plan().splits())
+                .forEachRemaining(row -> ret.add(row.getString(0) + ":" + row.getString(1)));
+        return ret;
+    }
+
+    private LocalDateTime date(int day) {
+        return LocalDateTime.of(LocalDate.of(2023, 1, day), LocalTime.MIN);
+    }
+
+    private List<CommitMessage> write(String f0, String f1) throws Exception {
+        return write(GenericRow.of(BinaryString.fromString(f0), BinaryString.fromString(f1)));
+    }
+
+    private List<CommitMessage> write(GenericRow row) throws Exception {
+        StreamTableWrite write =
+                table.copy(Collections.singletonMap(WRITE_ONLY.key(), "true")).newWrite("");
+        write.write(row);
+        TableCommitImpl commit = table.newCommit("");
+        List<CommitMessage> commitMessages = write.prepareCommit(true, 0);
+        commit.commit(0, commitMessages);
+        write.close();
+        commit.close();
+
+        return commitMessages;
+    }
+
+    private NormalPartitionExpire newExpire() {
+        FileStoreTable table = newExpireTable();
+        return (NormalPartitionExpire) table.store().newPartitionExpire("", table);
+    }
+
+    private FileStoreTable newExpireTable() {
+        Map<String, String> options = new HashMap<>();
+        options.put(PARTITION_EXPIRATION_TIME.key(), "2 d");
+        options.put(CoreOptions.PARTITION_EXPIRATION_CHECK_INTERVAL.key(), "1 d");
+        options.put(CoreOptions.PARTITION_TIMESTAMP_FORMATTER.key(), "yyyyMMdd");
+        return table.copy(options);
+    }
+}

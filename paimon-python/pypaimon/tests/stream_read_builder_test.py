@@ -1,0 +1,201 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""Tests for StreamReadBuilder."""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from pypaimon.read.read_type import OutputProjection
+
+from pypaimon.read.stream_read_builder import StreamReadBuilder
+from pypaimon.execution.python.read.streaming_table_scan import AsyncStreamingTableScan as PythonStreamScan
+from pypaimon.read.streaming_table_scan import StreamTableScan
+from pypaimon.schema.data_types import AtomicType, DataField
+
+
+class MockEntry:
+    """Mock manifest entry for testing bucket filtering."""
+
+    def __init__(self, bucket):
+        self.bucket = bucket
+
+
+@pytest.fixture
+def mock_table():
+    """Create a mock table for unit tests."""
+    table = MagicMock()
+    table.fields = []
+    table.options.row_tracking_enabled.return_value = False
+    table.options.native_plan_enabled.return_value = False
+    table.options.native_read_enabled.return_value = False
+    return table
+
+
+@pytest.fixture
+def builder(mock_table):
+    """Create a StreamReadBuilder with mock table."""
+    return StreamReadBuilder(mock_table)
+
+
+@pytest.fixture
+def mock_scan_table():
+    """Create mock table for AsyncStreamingTableScan."""
+    table = MagicMock()
+    table.options.changelog_producer.return_value = MagicMock()
+    table.file_io = MagicMock()
+    table.table_path = "/tmp/test"
+    table.fields = []
+    table.options.row_tracking_enabled.return_value = False
+    table.options.native_plan_enabled.return_value = False
+    table.options.native_read_enabled.return_value = False
+    table.catalog_environment.table_query_auth.return_value = None
+    return table
+
+
+class TestStreamReadBuilderValidation:
+    """Unit tests for StreamReadBuilder method validation."""
+
+    def test_with_bucket_filter_valid(self, builder):
+        """Test with_bucket_filter() accepts valid filter function."""
+        filter_fn = lambda b: b % 2 == 0
+        result = builder.with_bucket_filter(filter_fn)
+        assert result is builder
+        assert builder._bucket_filter is filter_fn
+
+    @pytest.mark.parametrize("bucket_ids,expected_true,expected_false", [
+        ([0, 2, 4], [0, 2, 4], [1, 3, 5]),
+        ([], [], [0, 1, 2]),
+        ([5], [5], [0, 1, 4, 6]),
+    ])
+    def test_with_buckets(self, builder, bucket_ids, expected_true, expected_false):
+        """Test with_buckets() creates correct filter."""
+        builder.with_buckets(bucket_ids)
+        for b in expected_true:
+            assert builder._bucket_filter(b), f"Bucket {b} should be included"
+        for b in expected_false:
+            assert not builder._bucket_filter(b), f"Bucket {b} should be excluded"
+
+    def test_with_consumer_id(self, builder):
+        """Test with_consumer_id() stores consumer_id and returns self."""
+        result = builder.with_consumer_id("my-consumer")
+        assert result is builder
+        assert builder._consumer_id == "my-consumer"
+
+    def test_method_chaining(self, builder):
+        """Test method chaining works correctly."""
+        result = (builder
+                  .with_poll_interval_ms(500)
+                  .with_bucket_filter(lambda b: b % 2 == 0)
+                  .with_include_row_kind(True))
+        assert result is builder
+        assert builder._poll_interval_ms == 500
+        assert builder._bucket_filter is not None
+        assert builder._include_row_kind is True
+
+    def test_named_variant_projection_is_read_not_plan_schema(self, mock_table):
+        mock_table.fields = [
+            DataField(0, 'id', AtomicType('INT')),
+            DataField(1, 'payload', AtomicType('VARIANT')),
+        ]
+        builder = StreamReadBuilder(mock_table).with_projection({
+            'id_alias': 'id',
+            'ratio': "try_variant_get(payload, '$.ratio', 'float')",
+        })
+        scan = builder.new_streaming_scan()
+        assert [field.name for field in scan._read_type] == ['id', 'payload']
+        with patch('pypaimon.read.stream_read_builder.TableRead') as read:
+            builder.new_read()
+        assert read.call_args.kwargs['output_projection'] == OutputProjection([
+            ('id_alias', ['id']), ('ratio', ['payload', '0'])], True)
+        assert (read.call_args.kwargs['read_type'][1].type.fields[0].description
+                == '__VARIANT_METADATA$.ratio;false;UTC')
+
+
+class TestAsyncStreamingTableScanFiltering:
+    """Test AsyncStreamingTableScan._filter_entries_for_shard()."""
+
+    def test_filter_with_bucket_filter(self, mock_scan_table):
+        """Test _filter_entries_for_shard with custom bucket filter."""
+        scan = PythonStreamScan(
+            table=mock_scan_table,
+            bucket_filter=lambda b: b % 2 == 0
+        )
+        entries = [MockEntry(b) for b in range(8)]
+        filtered = scan._filter_entries_for_shard(entries)
+        assert [e.bucket for e in filtered] == [0, 2, 4, 6]
+
+    def test_filter_no_filter_returns_all(self, mock_scan_table):
+        """Test _filter_entries_for_shard with no filter returns all entries."""
+        scan = PythonStreamScan(table=mock_scan_table)
+        entries = [MockEntry(b) for b in range(8)]
+        filtered = scan._filter_entries_for_shard(entries)
+        assert [e.bucket for e in filtered] == list(range(8))
+
+
+class TestConsumerIdPassthrough:
+    """Test that consumer_id passes through to AsyncStreamingTableScan."""
+
+    def test_new_streaming_scan_passes_consumer_id(self, mock_scan_table):
+        """new_streaming_scan() should pass consumer_id to AsyncStreamingTableScan."""
+        builder = StreamReadBuilder(mock_scan_table)
+        builder.with_consumer_id("test-consumer")
+
+        scan = builder.new_streaming_scan()
+
+        assert scan._consumer_id == "test-consumer"
+        assert scan._execution._consumer_manager is not None
+
+    def test_new_streaming_scan_no_consumer_by_default(self, mock_scan_table):
+        """Without with_consumer_id(), scan should have no consumer."""
+        builder = StreamReadBuilder(mock_scan_table)
+
+        scan = builder.new_streaming_scan()
+
+        assert scan._consumer_id is None
+        assert scan._execution._consumer_manager is None
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
+
+
+class TestNativeStreamFactory:
+    def test_optional_native_initialization_falls_back(self, mock_scan_table):
+        mock_scan_table.options.native_plan_enabled.return_value = True
+        builder = StreamReadBuilder(mock_scan_table)
+        with patch('pypaimon.execution.native.read.streaming_table_scan.StreamTableScan',
+                   side_effect=ImportError('optional native runtime unavailable')):
+            scan = builder.new_streaming_scan()
+            assert isinstance(scan, StreamTableScan)
+            assert isinstance(scan._execution, PythonStreamScan)
+
+    def test_native_planning_failure_is_not_retried_with_python(self, mock_scan_table):
+        from pypaimon.read.streaming_table_scan import StreamTableScan
+        failure = LookupError('native planning failed')
+        mock_scan_table.options.native_plan_enabled.return_value = True
+        native = MagicMock()
+        native.plan.side_effect = failure
+        with patch('pypaimon.execution.native.read.streaming_table_scan.native_stream_scan', return_value=native):
+            scan = StreamTableScan(mock_scan_table)
+        with patch('pypaimon.execution.python.read.streaming_table_scan.FileScanner') as python_planner:
+            with pytest.raises(LookupError) as caught:
+                scan.plan()
+        assert caught.value is failure
+        python_planner.assert_not_called()
+        native.plan.assert_called_once()
